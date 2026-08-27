@@ -19,6 +19,7 @@ bool mla_decode_launch(
     bool is_fp16,
     int page_size,
     void* out,
+    void* lse,
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,

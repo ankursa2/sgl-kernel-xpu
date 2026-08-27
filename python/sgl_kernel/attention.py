@@ -60,6 +60,7 @@ def flash_mla_decode(
     workspace: torch.Tensor,
     sm_scale: float,
     num_kv_splits: int = 1,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
@@ -118,8 +119,13 @@ def flash_mla_decode(
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
 
+    # lse is log base 2, one value per (batch, head); populated on both the
+    # split-KV and non-split-KV paths
+    lse = torch.empty((B_q, H), dtype=torch.float32, device=q_nope.device)
+
     torch.ops.sgl_kernel.flash_mla_decode.default(
         out,
+        lse,
         q_nope,
         q_pe,
         kv_c_and_k_pe_cache,
@@ -129,8 +135,9 @@ def flash_mla_decode(
         sm_scale,
         num_kv_splits,
     )
+    if return_lse:
+        return out if device_type == "xpu" else out[:, :H].contiguous(), lse
     return out if device_type == "xpu" else out[:, :H].contiguous()
-
 
 def flash_mla_get_workspace_size(
     max_seq_len: int,

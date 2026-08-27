@@ -368,7 +368,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("flash_mla_decode_get_workspace_size", &flash_mla_decode_get_workspace_size);
 
   m.def(
-      "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
+      "flash_mla_decode(Tensor! out, Tensor! lse, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
       "Tensor! "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
