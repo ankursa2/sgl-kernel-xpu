@@ -101,6 +101,7 @@ class XeMlaFwdKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo or ragged row, num_heads_q, batch)
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -149,6 +150,10 @@ class XeMlaFwdKernel {
     // Cumulative Q sequence lengths for varlen/ragged Q [batch + 1].
     // When nullptr, Q is fixed-shape (decode or old-style prefill).
     const int* cu_seqlens_q = nullptr;
+
+    // Optional log-sum-exp output (log base 2), one value per (row, head, batch).
+    float* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Default constructor
     KernelArguments() = default;
@@ -355,8 +360,21 @@ class XeMlaFwdKernel {
         sycl::group_barrier(get_work_group<3>());
       }
 
+      float* lse_ptr = nullptr;
+      int lse_row_stride = 0;
+      if (p.LSE != nullptr) {
+        lse_row_stride = static_cast<int>(get<0>(p.dLSE_out));
+        int64_t lse_offset = static_cast<int64_t>(head_coord) * get<1>(p.dLSE_out) +
+                              static_cast<int64_t>(batch_slice_idx) * get<2>(p.dLSE_out);
+        float* lse_base = p.LSE + lse_offset;
+        if constexpr (CollectiveMainloop::IsPrefill) {
+          lse_base += static_cast<int64_t>(q_start) * lse_row_stride;
+        }
+        lse_ptr = lse_base;
+      }
+
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id, lse_ptr, lse_row_stride);
     }
   }
 };
@@ -398,6 +416,7 @@ class XeMlaSplitKVKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -452,6 +471,11 @@ class XeMlaSplitKVKernel {
     // Final output
     ElementO* O = nullptr;
     StrideO dO{};
+
+    // Final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch);
+    // computed and written by the split-KV reduction kernel, not this kernel.
+    float* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;

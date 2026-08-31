@@ -139,20 +139,31 @@ class XeMlaEpilogue {
     return true;
   }
 
+  /// Non-split-KV epilogue operator. Also used for prefill, where a single
+  /// tile can span multiple Q rows (decode always has exactly one).
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,        // Global O tensor: (q,v)
+      FragA& tArA,               // O accumulator:   (q,v)
+      FragARow& tA_max,          // Softmax row-wise max accumulator
+      FragARow& tA_sum,          // Softmax row-wise sum accumulator
+      QVCoord blk_qv,            // WG tile indices: (Q,V)
+      int thr_id,                // Work-item ID
+      float* lse_ptr = nullptr,  // Optional: base ptr for this (head,batch)'s per-row LSE (log2)
+      int lse_row_stride = 0) {  // Element stride between consecutive Q rows in lse_ptr
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    // LSE (log base 2) per row; must be captured before rA_sum is inverted below.
+    FragARow rA_lse;
+    if (lse_ptr != nullptr) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_lse.size(); i++)
+        rA_lse(i) = ElementA(float(rA_max(i)) + sycl::native::log2(float(rA_sum(i))));
+    }
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
@@ -182,6 +193,31 @@ class XeMlaEpilogue {
     /* Reorder tile and write out */
     reorder(rA, tOrO);
     copy(copy_o, tOrO, tOgO);
+
+    // Scatter per-row LSE using O's own coordinate mapping: broadcast each
+    // row's value across V (matching rA's shape), reorder identically to rA
+    // so element i lines up with tOgO(i)'s global (q,v) coordinate, then
+    // write once per row (guarded on this tile's first V column). Decode has
+    // exactly one row per tile; prefill can have up to Q_TILE_M.
+    if (lse_ptr != nullptr) {
+      FragA rA_lse_full;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_lse_full.size(); i++)
+        rA_lse_full(i) = broadcast<0>(rA_lse, rA_lse_full, i);
+
+      auto tOrLSE = thr_copy_o.partition_sg_fragment_S(gO);
+      reorder(rA_lse_full, tOrLSE);
+
+      int v_tile_start = int(get<1>(blk_qv)) * int(get<1>(TileShapeO{}));
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tOgO); i++) {
+        auto coord = tOgO(i);
+        if (int(get<1>(coord)) == v_tile_start) {
+          int q_global = int(get<0>(coord));
+          lse_ptr[q_global * lse_row_stride] = static_cast<float>(tOrLSE(i));
+        }
+      }
+    }
   }
 
   /// Split-KV epilogue operator.

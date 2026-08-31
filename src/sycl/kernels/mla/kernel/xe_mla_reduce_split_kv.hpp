@@ -79,6 +79,7 @@ class XeMlaReduceSplitKV {
   using SGPerWG = typename MlaKernel_::SGPerWG;
 
   using ElementLSE = float;  // exp_sums/max_logits accumulator type
+  using StrideLSEOut = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
 
   // Number of output values processed by each thread
   static constexpr int num_vals_per_thread = int(get<1>(TileShapeO{}) / (SGPerWG::value * intel::sg_size));
@@ -98,6 +99,9 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
+    // Optional final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch)
+    float* LSE = nullptr;
+    StrideLSEOut dLSE_out{};
   };
   //
   // KernelParams
@@ -187,6 +191,7 @@ class XeMlaReduceSplitKV {
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.exp_sums)), make_layout(shape_exp_sums, p.dLSE));
     Tensor max_logits =
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.max_logits)), make_layout(shape_max_logits, p.dLSE));
+    Tensor LSE = make_tensor(make_gmem_ptr(p.LSE), make_layout(make_shape(seq_len_qo, num_heads_q, batch), p.dLSE_out));
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -238,6 +243,11 @@ class XeMlaReduceSplitKV {
         acc *= inv_global_exp_sums;
 
         O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);
+
+        // lse is log base 2, matching this kernel's exp2-based accumulation.
+        if (j == 0 && p.LSE != nullptr) {
+          LSE(seq_idx, head_q, idx_b) = global_max + sycl::native::log2(global_exp_sums);
+        }
       }
     }
   }
