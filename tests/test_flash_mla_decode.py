@@ -1,11 +1,16 @@
 import gc
+import math
 import os
 import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import flash_mla_decode, flash_mla_decode_get_workspace_size
+from sgl_kernel import (
+    flash_mla_decode,
+    flash_mla_decode_get_workspace_size,
+    flash_mla_get_workspace_size,
+)
 from torch import Tensor
 
 LONG_TESTS = os.getenv("LONG_TESTS") == "1"
@@ -149,6 +154,93 @@ def test_flash_mla_decode(
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
 
     del out, out_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
+    del workspace, seq_lens_xpu
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("bs", [1, 4])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_kv_splits", [1, 2, 4])
+def test_flash_mla_decode_return_lse(
+    dtype: torch.dtype,
+    bs: int,
+    num_heads: int,
+    num_kv_splits: int,
+):
+    """return_lse=True on both the split-KV and non-split-KV (num_kv_splits=1)
+    paths: lse must match logsumexp(QK^T * scale) in log base 2, matching
+    flash_mla_decode's documented lse convention."""
+    torch.random.manual_seed(0)
+
+    d = 576
+    h_q = num_heads
+    dv = 512
+    mean_seq_len = 4096
+    block_size = 64
+
+    q_nope_dim = 128
+    q_pe_dim = 64
+    scale = (q_nope_dim + q_pe_dim) ** (-0.5)
+    seq_lens_cpu = torch.full((bs,), mean_seq_len, dtype=torch.int32)
+    max_seq_len = seq_lens_cpu.max().item()
+    block_num = (max_seq_len + block_size - 1) // block_size
+    pack_factor = 128 // block_size
+    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
+
+    q_cpu = torch.randn(bs, h_q, d, dtype=dtype, device="cpu") * 100
+    block_table_cpu = torch.randint(
+        0, bs * block_num, (bs, block_num), dtype=torch.int32, device="cpu"
+    )
+    kv_cache_cpu = torch.randn(
+        block_table_cpu.numel(), block_size, d, dtype=dtype, device="cpu"
+    )
+
+    # --- Reference lse: natural-log logsumexp(QK^T * scale), converted to log2 ---
+    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32)
+    for i in range(bs):
+        kv = kv_cache_cpu[block_table_cpu[i]].reshape(1, -1, d)[:, : seq_lens_cpu[i]]
+        kv_f = kv[0].float()
+        for h in range(h_q):
+            q_h = q_cpu[i, h].float()
+            scores = (q_h @ kv_f.T) * scale
+            lse_ref[i, h] = torch.logsumexp(scores, dim=-1) / math.log(2)
+
+    # --- Kernel under test ---
+    q_xpu = q_cpu.to(device=device)
+    kv_cache_xpu = kv_cache_cpu.to(device=device)
+    block_table_xpu = block_table_cpu.to(device=device)
+    seq_lens_xpu = seq_lens_cpu.to(device=device)
+    del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
+
+    workspace_size = flash_mla_get_workspace_size(
+        block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
+    )
+    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+
+    q_nope = torch.empty((h_q, bs, dv), dtype=dtype, device=device).transpose(0, 1)
+    q_nope.copy_(q_xpu[:, :, :dv])
+    q_pe = q_xpu[:, :, dv:].clone()
+    del q_xpu
+
+    out, lse = flash_mla_decode(
+        q_nope,
+        q_pe,
+        kv_cache_xpu,
+        seq_lens_xpu,
+        block_table_xpu,
+        workspace,
+        scale,
+        num_kv_splits,
+        return_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    assert out.shape == (bs, h_q, dv)
+    assert lse.shape == (bs, h_q)
+    atol, rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(lse_ref, lse.cpu().float(), atol=atol, rtol=rtol)
+
+    del out, lse, q_nope, q_pe, kv_cache_xpu, block_table_xpu
     del workspace, seq_lens_xpu
 
 

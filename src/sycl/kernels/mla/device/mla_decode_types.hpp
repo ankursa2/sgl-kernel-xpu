@@ -193,6 +193,7 @@ struct MlaXe {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -312,6 +313,21 @@ inline typename T::Fmla::Arguments args_from_options(
     kernel_args.exp_sums = exp_sums_ptr;
     kernel_args.max_logits = max_logits_ptr;
     kernel_args.dLSE = stride_lse;
+    // Final combined LSE, shape (seq_len_qo=1, num_heads_q, batch); matches
+    // the Python-side lse tensor's (B, H) row-major layout (H contiguous).
+    kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+    kernel_args.dLSE_out = cute::make_stride(
+        static_cast<int>(problem_shape.num_heads_q * problem_shape.batch),
+        cute::_1{},
+        static_cast<int>(problem_shape.num_heads_q));
+  } else {
+    // Non-split-KV kernel writes LSE directly in its own epilogue; same
+    // (B, H) row-major layout as the split-KV path's final combine.
+    kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+    kernel_args.dLSE_out = cute::make_stride(
+        static_cast<int>(problem_shape.num_heads_q * problem_shape.batch),
+        cute::_1{},
+        static_cast<int>(problem_shape.num_heads_q));
   }
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
@@ -328,6 +344,7 @@ inline typename T::Fmla::Arguments args_from_options(
 template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
 inline void runMlaImpl(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -339,7 +356,7 @@ inline void runMlaImpl(
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -349,6 +366,7 @@ inline void runMlaImpl(
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -379,9 +397,9 @@ inline void runMla(
 
   if (num_kv_splits == 1) {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   }
 }

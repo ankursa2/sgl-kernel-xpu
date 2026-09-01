@@ -74,6 +74,7 @@ class XeMlaReduceSplitKV {
   // Derive types from the main MLA split-KV kernel
   using ElementO = typename MlaKernel_::ElementO;
   using StrideO = typename MlaKernel_::StrideO;
+  using StrideLSE = typename MlaKernel_::StrideLSE;
   using TileShapeO = typename MlaKernel_::TileShapeO;
   using TileShapeQK = typename MlaKernel_::TileShapeQK;
   using SGPerWG = typename MlaKernel_::SGPerWG;
@@ -98,6 +99,10 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
+
+    // Final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch)
+    ElementLSE* LSE = nullptr;
+    StrideLSE dLSE_out{};
   };
   //
   // KernelParams
@@ -187,6 +192,7 @@ class XeMlaReduceSplitKV {
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.exp_sums)), make_layout(shape_exp_sums, p.dLSE));
     Tensor max_logits =
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.max_logits)), make_layout(shape_max_logits, p.dLSE));
+    Tensor LSE = make_tensor(make_gmem_ptr(p.LSE), make_layout(make_shape(seq_len_qo, num_heads_q, batch), p.dLSE_out));
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -238,6 +244,11 @@ class XeMlaReduceSplitKV {
         acc *= inv_global_exp_sums;
 
         O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);
+
+        // lse is log base 2, matching this kernel's exp2-based accumulation
+        if (j == 0) {
+          LSE(seq_idx, head_q, idx_b) = global_max + sycl::native::log2(global_exp_sums);
+        }
       }
     }
   }

@@ -82,6 +82,7 @@ void mha_fwd(
 
 void flash_mla_decode(
     torch::Tensor& out,
+    torch::Tensor& lse,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,

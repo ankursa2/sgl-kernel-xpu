@@ -101,6 +101,7 @@ class XeMlaFwdKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -149,6 +150,10 @@ class XeMlaFwdKernel {
     // Cumulative Q sequence lengths for varlen/ragged Q [batch + 1].
     // When nullptr, Q is fixed-shape (decode or old-style prefill).
     const int* cu_seqlens_q = nullptr;
+
+    // Optional log-sum-exp output (log base 2), one value per (seq_idx, head_q, batch).
+    float* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Default constructor
     KernelArguments() = default;
@@ -227,6 +232,9 @@ class XeMlaFwdKernel {
     ProblemShape const& s = p.shape;
 
     int thr_id = int(ThreadIdxX());
+
+    Tensor LSE = make_tensor(
+      make_gmem_ptr(p.LSE), make_layout(make_shape(s.seq_len_qo, s.num_heads_q, s.batch), p.dLSE_out));
 
     TileScheduler tile_scheduler{params.scheduler};
 
@@ -356,7 +364,8 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      float* lse_out = (p.LSE != nullptr) ? &LSE(0, head_coord, batch_slice_idx) : nullptr;
+      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id, lse_out);
     }
   }
 };
@@ -398,6 +407,7 @@ class XeMlaSplitKVKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -448,6 +458,10 @@ class XeMlaSplitKVKernel {
     ElementAcc* exp_sums = nullptr;    // (batch, num_heads, num_kv_splits)
     ElementAcc* max_logits = nullptr;  // (batch, num_heads, num_kv_splits)
     StrideO dLSE{};
+
+    // Final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch)
+    float* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Final output
     ElementO* O = nullptr;

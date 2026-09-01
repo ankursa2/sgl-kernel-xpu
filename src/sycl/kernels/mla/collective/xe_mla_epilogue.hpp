@@ -141,18 +141,23 @@ class XeMlaEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,          // Global O tensor: (q,v)
+      FragA& tArA,                 // O accumulator:   (q,v)
+      FragARow& tA_max,            // Softmax row-wise max accumulator
+      FragARow& tA_sum,            // Softmax row-wise sum accumulator
+      QVCoord blk_qv,              // WG tile indices: (Q,V)
+      int thr_id,                  // Work-item ID
+      float* lse_out = nullptr) {  // Optional: log2(sum) + max, written by thread 0
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    // LSE (log base 2) must be captured before rA_sum is inverted below.
+    if (lse_out != nullptr && thr_id == 0) {
+      *lse_out = static_cast<float>(rA_max(0)) + sycl::native::log2(static_cast<float>(rA_sum(0)));
+    }
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;

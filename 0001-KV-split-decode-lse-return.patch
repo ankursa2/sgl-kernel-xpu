@@ -1,0 +1,601 @@
+From ecd42694673cddd0a09793bd723cfd87d3acdc3e Mon Sep 17 00:00:00 2001
+From: Ankur Saxena <ankur.saxena@intel.com>
+Date: Thu, 27 Aug 2026 11:11:26 +0000
+Subject: [PATCH] KV split decode lse return
+
+---
+ include/sgl_flash_kernel_ops.h                |  4 +-
+ python/sgl_kernel/attention.py                | 10 +-
+ src/jit/mla_jit.cpp                           |  5 +-
+ src/jit/mla_jit.h                             |  1 +
+ .../mla/collective/xe_mla_epilogue.hpp        | 21 +++--
+ .../mla/device/mla_decode_dispatch.hpp        |  1 +
+ .../kernels/mla/device/mla_decode_types.hpp   | 24 ++++-
+ src/sycl/kernels/mla/device/mla_runner.hpp    |  2 +
+ src/sycl/kernels/mla/kernel/xe_mla_kernel.hpp | 16 +++-
+ .../mla/kernel/xe_mla_reduce_split_kv.hpp     | 11 +++
+ src/sycl/mla_decode.cpp                       | 18 +++-
+ src/sycl/mla_decode_kernel.cpp.in             |  5 +-
+ src/torch_extension_sycl.cc                   |  4 +-
+ tests/test_flash_mla_decode.py                | 94 ++++++++++++++++++-
+ 14 files changed, 191 insertions(+), 25 deletions(-)
+
+diff --git a/include/sgl_flash_kernel_ops.h b/include/sgl_flash_kernel_ops.h
+index 86e7d48..506d52c 100644
+--- a/include/sgl_flash_kernel_ops.h
++++ b/include/sgl_flash_kernel_ops.h
+@@ -82,6 +82,7 @@ void mha_fwd(
+ 
+ void flash_mla_decode(
+     torch::Tensor& out,
++    torch::Tensor& lse,
+     const torch::Tensor& q_nope,
+     const torch::Tensor& q_pe,
+     const torch::Tensor& kv_c_and_k_pe_cache,
+@@ -89,7 +90,8 @@ void flash_mla_decode(
+     const torch::Tensor& page_table,
+     torch::Tensor& workspace,
+     double sm_scale,
+-    int64_t num_kv_splits = -1);
++    int64_t num_kv_splits = -1,
++    bool require_lse = false);
+ 
+ int64_t flash_mla_decode_get_workspace_size(
+     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
+diff --git a/python/sgl_kernel/attention.py b/python/sgl_kernel/attention.py
+index 58e6e8d..b17223c 100644
+--- a/python/sgl_kernel/attention.py
++++ b/python/sgl_kernel/attention.py
+@@ -60,6 +60,7 @@ def flash_mla_decode(
+     workspace: torch.Tensor,
+     sm_scale: float,
+     num_kv_splits: int = 1,
++    return_lse: bool = False,
+ ) -> torch.Tensor:
+     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
+     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
+@@ -118,8 +119,13 @@ def flash_mla_decode(
+         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
+     )
+ 
++    # lse is log base 2, one value per (batch, head); populated on both the
++    # split-KV and non-split-KV paths
++    lse = torch.empty((B_q, H), dtype=torch.float32, device=q_nope.device)
++
+     torch.ops.sgl_kernel.flash_mla_decode.default(
+         out,
++        lse,
+         q_nope,
+         q_pe,
+         kv_c_and_k_pe_cache,
+@@ -128,10 +134,12 @@ def flash_mla_decode(
+         workspace,
+         sm_scale,
+         num_kv_splits,
++        return_lse,
+     )
++    if return_lse:
++        return out if device_type == "xpu" else out[:, :H].contiguous(), lse
+     return out if device_type == "xpu" else out[:, :H].contiguous()
+ 
+-
+ def flash_mla_get_workspace_size(
+     max_seq_len: int,
+     num_batches: int,
+diff --git a/src/jit/mla_jit.cpp b/src/jit/mla_jit.cpp
+index 7958765..e18a2cb 100644
+--- a/src/jit/mla_jit.cpp
++++ b/src/jit/mla_jit.cpp
+@@ -30,7 +30,7 @@ bool check_config(const char* op_label, std::string* err) {
+ }
+ 
+ using DecodeFn =
+-    void (*)(void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
++    void (*)(void*, void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
+ 
+ uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
+   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+@@ -68,6 +68,7 @@ bool mla_decode_launch(
+     bool is_fp16,
+     int page_size,
+     void* out,
++    void* lse,
+     const void* q_nope,
+     const void* q_pe,
+     const void* kv_c_and_k_pe_cache,
+@@ -80,7 +81,7 @@ bool mla_decode_launch(
+     std::string* err) {
+   DecodeFn fn = resolve_decode(is_fp16, page_size, arch, err);
+   if (!fn) return false;
+-  fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
++  fn(out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+   return true;
+ }
+ 
+diff --git a/src/jit/mla_jit.h b/src/jit/mla_jit.h
+index 189aa94..d7b944d 100644
+--- a/src/jit/mla_jit.h
++++ b/src/jit/mla_jit.h
+@@ -19,6 +19,7 @@ bool mla_decode_launch(
+     bool is_fp16,
+     int page_size,
+     void* out,
++    void* lse,
+     const void* q_nope,
+     const void* q_pe,
+     const void* kv_c_and_k_pe_cache,
+diff --git a/src/sycl/kernels/mla/collective/xe_mla_epilogue.hpp b/src/sycl/kernels/mla/collective/xe_mla_epilogue.hpp
+index f053b91..176cc65 100644
+--- a/src/sycl/kernels/mla/collective/xe_mla_epilogue.hpp
++++ b/src/sycl/kernels/mla/collective/xe_mla_epilogue.hpp
+@@ -141,18 +141,23 @@ class XeMlaEpilogue {
+ 
+   template <typename QVCoord>
+   CUTLASS_DEVICE void operator()(
+-      TensorO2D const& O,  // Global O tensor: (q,v)
+-      FragA& tArA,         // O accumulator:   (q,v)
+-      FragARow& tA_max,    // Softmax row-wise max accumulator
+-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
+-      QVCoord blk_qv,      // WG tile indices: (Q,V)
+-      int thr_id) {        // Work-item ID
++      TensorO2D const& O,          // Global O tensor: (q,v)
++      FragA& tArA,                 // O accumulator:   (q,v)
++      FragARow& tA_max,            // Softmax row-wise max accumulator
++      FragARow& tA_sum,            // Softmax row-wise sum accumulator
++      QVCoord blk_qv,              // WG tile indices: (Q,V)
++      int thr_id,                  // Work-item ID
++      float* lse_out = nullptr) {  // Optional: log2(sum) + max, written by thread 0
+     using namespace cute;
+     using ElementA = typename FragA::element_type;
+ 
+     // Reduce k-blocks of A and A_sum across WG, if needed.
+-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+-    (void)rA_max_unused;
++    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
++
++    // LSE (log base 2) must be captured before rA_sum is inverted below.
++    if (lse_out != nullptr && thr_id == 0) {
++      *lse_out = static_cast<float>(rA_max(0)) + sycl::native::log2(static_cast<float>(rA_sum(0)));
++    }
+ 
+     /* Some subgroups may not have any work to do; if so, quit early. */
+     if (!active) return;
+diff --git a/src/sycl/kernels/mla/device/mla_decode_dispatch.hpp b/src/sycl/kernels/mla/device/mla_decode_dispatch.hpp
+index db94501..effe55f 100644
+--- a/src/sycl/kernels/mla/device/mla_decode_dispatch.hpp
++++ b/src/sycl/kernels/mla/device/mla_decode_dispatch.hpp
+@@ -52,6 +52,7 @@ namespace mla_decode {
+ #define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)  \
+   void launch_mla_decode_##ELEM##_##PS(      \
+       at::Tensor& out,                       \
++      at::Tensor& lse,                       \
+       const at::Tensor& q_nope,              \
+       const at::Tensor& q_pe,                \
+       const at::Tensor& kv_c_and_k_pe_cache, \
+diff --git a/src/sycl/kernels/mla/device/mla_decode_types.hpp b/src/sycl/kernels/mla/device/mla_decode_types.hpp
+index 765eef1..433aa55 100644
+--- a/src/sycl/kernels/mla/device/mla_decode_types.hpp
++++ b/src/sycl/kernels/mla/device/mla_decode_types.hpp
+@@ -193,6 +193,7 @@ struct MlaXe {
+ template <typename T>
+ inline typename T::Fmla::Arguments args_from_options(
+     at::Tensor const& out,
++    at::Tensor const& lse,
+     at::Tensor const& q_nope,
+     at::Tensor const& q_pe,
+     at::Tensor const& kv_c_and_k_pe_cache,
+@@ -312,6 +313,21 @@ inline typename T::Fmla::Arguments args_from_options(
+     kernel_args.exp_sums = exp_sums_ptr;
+     kernel_args.max_logits = max_logits_ptr;
+     kernel_args.dLSE = stride_lse;
++    // Final combined LSE, shape (seq_len_qo=1, num_heads_q, batch); matches
++    // the Python-side lse tensor's (B, H) row-major layout (H contiguous).
++    kernel_args.LSE = static_cast<float*>(lse.data_ptr());
++    kernel_args.dLSE_out = cute::make_stride(
++        static_cast<int>(problem_shape.num_heads_q * problem_shape.batch),
++        cute::_1{},
++        static_cast<int>(problem_shape.num_heads_q));
++  } else {
++    // Non-split-KV kernel writes LSE directly in its own epilogue; same
++    // (B, H) row-major layout as the split-KV path's final combine.
++    kernel_args.LSE = static_cast<float*>(lse.data_ptr());
++    kernel_args.dLSE_out = cute::make_stride(
++        static_cast<int>(problem_shape.num_heads_q * problem_shape.batch),
++        cute::_1{},
++        static_cast<int>(problem_shape.num_heads_q));
+   }
+   typename T::CollectiveMainloop::Arguments mainloop_args{
+       static_cast<float>(sm_scale),
+@@ -328,6 +344,7 @@ inline typename T::Fmla::Arguments args_from_options(
+ template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
+ inline void runMlaImpl(
+     at::Tensor const& out,
++    at::Tensor const& lse,
+     at::Tensor const& q_nope,
+     at::Tensor const& q_pe,
+     at::Tensor const& kv_c_and_k_pe_cache,
+@@ -339,7 +356,7 @@ inline void runMlaImpl(
+   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
+   typename MlaXeType::Fmla fmla;
+   auto arguments = args_from_options<MlaXeType>(
+-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
++      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+ 
+   CUTLASS_CHECK(fmla.can_implement(arguments));
+ 
+@@ -349,6 +366,7 @@ inline void runMlaImpl(
+ template <typename Element, typename PageSizeOpt>
+ inline void runMla(
+     at::Tensor const& out,
++    at::Tensor const& lse,
+     at::Tensor const& q_nope,
+     at::Tensor const& q_pe,
+     at::Tensor const& kv_c_and_k_pe_cache,
+@@ -379,9 +397,9 @@ inline void runMla(
+ 
+   if (num_kv_splits == 1) {
+     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
+-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
++        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+   } else {
+     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
+-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
++        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+   }
+ }
+diff --git a/src/sycl/kernels/mla/device/mla_runner.hpp b/src/sycl/kernels/mla/device/mla_runner.hpp
+index 5593d88..0cefd9e 100644
+--- a/src/sycl/kernels/mla/device/mla_runner.hpp
++++ b/src/sycl/kernels/mla/device/mla_runner.hpp
+@@ -168,6 +168,8 @@ class MLA {
+       reduce_kernel_args.exp_sums = args.kernel.exp_sums;
+       reduce_kernel_args.max_logits = args.kernel.max_logits;
+       reduce_kernel_args.dLSE = args.kernel.dLSE;
++      reduce_kernel_args.LSE = args.kernel.LSE;
++      reduce_kernel_args.dLSE_out = args.kernel.dLSE_out;
+ 
+       ReductionArguments reduce_args{reduce_kernel_args, args.hw_info, split_kv};
+       params_.reduction_params = ReductionKernel::to_underlying_arguments(reduce_args, workspace);
+diff --git a/src/sycl/kernels/mla/kernel/xe_mla_kernel.hpp b/src/sycl/kernels/mla/kernel/xe_mla_kernel.hpp
+index 7e35899..19b317d 100644
+--- a/src/sycl/kernels/mla/kernel/xe_mla_kernel.hpp
++++ b/src/sycl/kernels/mla/kernel/xe_mla_kernel.hpp
+@@ -101,6 +101,7 @@ class XeMlaFwdKernel {
+   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
+   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
+   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
++  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
+ 
+   // Tile scheduler derived types
+   using TileScheduler = TileScheduler_;
+@@ -150,6 +151,10 @@ class XeMlaFwdKernel {
+     // When nullptr, Q is fixed-shape (decode or old-style prefill).
+     const int* cu_seqlens_q = nullptr;
+ 
++    // Optional log-sum-exp output (log base 2), one value per (seq_idx, head_q, batch).
++    float* LSE = nullptr;
++    StrideLSE dLSE_out{};
++
+     // Default constructor
+     KernelArguments() = default;
+   };
+@@ -228,6 +233,9 @@ class XeMlaFwdKernel {
+ 
+     int thr_id = int(ThreadIdxX());
+ 
++    Tensor LSE = make_tensor(
++      make_gmem_ptr(p.LSE), make_layout(make_shape(s.seq_len_qo, s.num_heads_q, s.batch), p.dLSE_out));
++
+     TileScheduler tile_scheduler{params.scheduler};
+ 
+     CUTLASS_PRAGMA_NO_UNROLL
+@@ -356,7 +364,8 @@ class XeMlaFwdKernel {
+       }
+ 
+       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
+-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
++      float* lse_out = (p.LSE != nullptr) ? &LSE(0, head_coord, batch_slice_idx) : nullptr;
++      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id, lse_out);
+     }
+   }
+ };
+@@ -398,6 +407,7 @@ class XeMlaSplitKVKernel {
+   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
+   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
+   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
++  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
+ 
+   // Tile scheduler derived types
+   using TileScheduler = TileScheduler_;
+@@ -449,6 +459,10 @@ class XeMlaSplitKVKernel {
+     ElementAcc* max_logits = nullptr;  // (batch, num_heads, num_kv_splits)
+     StrideO dLSE{};
+ 
++    // Final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch)
++    float* LSE = nullptr;
++    StrideLSE dLSE_out{};
++
+     // Final output
+     ElementO* O = nullptr;
+     StrideO dO{};
+diff --git a/src/sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp b/src/sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp
+index dde51b8..e895bc1 100644
+--- a/src/sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp
++++ b/src/sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp
+@@ -74,6 +74,7 @@ class XeMlaReduceSplitKV {
+   // Derive types from the main MLA split-KV kernel
+   using ElementO = typename MlaKernel_::ElementO;
+   using StrideO = typename MlaKernel_::StrideO;
++  using StrideLSE = typename MlaKernel_::StrideLSE;
+   using TileShapeO = typename MlaKernel_::TileShapeO;
+   using TileShapeQK = typename MlaKernel_::TileShapeQK;
+   using SGPerWG = typename MlaKernel_::SGPerWG;
+@@ -98,6 +99,10 @@ class XeMlaReduceSplitKV {
+     const ElementLSE* exp_sums = nullptr;
+     const ElementLSE* max_logits = nullptr;
+     StrideO dLSE{};
++
++    // Final combined log-sum-exp (log base 2), one value per (seq_idx, head_q, batch)
++    ElementLSE* LSE = nullptr;
++    StrideLSE dLSE_out{};
+   };
+   //
+   // KernelParams
+@@ -187,6 +192,7 @@ class XeMlaReduceSplitKV {
+         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.exp_sums)), make_layout(shape_exp_sums, p.dLSE));
+     Tensor max_logits =
+         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.max_logits)), make_layout(shape_max_logits, p.dLSE));
++    Tensor LSE = make_tensor(make_gmem_ptr(p.LSE), make_layout(make_shape(seq_len_qo, num_heads_q, batch), p.dLSE_out));
+ 
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+@@ -238,6 +244,11 @@ class XeMlaReduceSplitKV {
+         acc *= inv_global_exp_sums;
+ 
+         O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);
++
++        // lse is log base 2, matching this kernel's exp2-based accumulation
++        if (j == 0) {
++          LSE(seq_idx, head_q, idx_b) = global_max + sycl::native::log2(global_exp_sums);
++        }
+       }
+     }
+   }
+diff --git a/src/sycl/mla_decode.cpp b/src/sycl/mla_decode.cpp
+index 0409027..5e195a0 100644
+--- a/src/sycl/mla_decode.cpp
++++ b/src/sycl/mla_decode.cpp
+@@ -100,19 +100,19 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
+     switch (page_size) {                                                                                       \
+       case 16:                                                                                                 \
+         mla_decode::launch_mla_decode_##ELEM##_16(                                                             \
+-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
++            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+         break;                                                                                                 \
+       case 32:                                                                                                 \
+         mla_decode::launch_mla_decode_##ELEM##_32(                                                             \
+-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
++            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+         break;                                                                                                 \
+       case 64:                                                                                                 \
+         mla_decode::launch_mla_decode_##ELEM##_64(                                                             \
+-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
++            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+         break;                                                                                                 \
+       case 128:                                                                                                \
+         mla_decode::launch_mla_decode_##ELEM##_128(                                                            \
+-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
++            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+         break;                                                                                                 \
+       default:                                                                                                 \
+         TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size);                               \
+@@ -137,6 +137,7 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
+ /// @brief Dispatch kernel implementation for MLA decode.
+ SGL_KERNEL_EXPORT void flash_mla_decode(
+     at::Tensor& out,                        // (batch, num_heads, latent_dim)
++    at::Tensor& lse,                        // (batch, num_heads), log base 2
+     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
+     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
+     const at::Tensor& kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
+@@ -144,8 +145,10 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
+     const at::Tensor& page_table,           // (batch_size, max_num_pages_per_seq)
+     at::Tensor& workspace,
+     double sm_scale,  // softmax scale
+-    int64_t num_kv_splits) {
++    int64_t num_kv_splits,
++    bool require_lse) {
+   CHECK_INPUT(out);
++  CHECK_INPUT(lse);
+   CHECK_INPUT(q_nope);
+   CHECK_INPUT(q_pe);
+   CHECK_INPUT(kv_c_and_k_pe_cache);
+@@ -168,6 +171,10 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
+       page_size,
+       ". Supported: 16, 32, 64, 128");
+ 
++  // lse is now always computed (split-KV and non-split-KV); kept for schema
++  // compatibility with callers that only want lse when return_lse=True.
++  (void)require_lse;
++
+   if (num_kv_splits < 1) {
+     int page_count_per_seq = page_table.size(1);
+     int max_seq_len = page_size * page_count_per_seq;
+@@ -182,6 +189,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
+             in_dtype == at::ScalarType::Half,
+             page_size,
+             &out,
++            &lse,
+             &q_nope,
+             &q_pe,
+             &kv_c_and_k_pe_cache,
+diff --git a/src/sycl/mla_decode_kernel.cpp.in b/src/sycl/mla_decode_kernel.cpp.in
+index b8b15cd..4c28b55 100644
+--- a/src/sycl/mla_decode_kernel.cpp.in
++++ b/src/sycl/mla_decode_kernel.cpp.in
+@@ -38,6 +38,7 @@ namespace mla_decode {
+ 
+ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+     at::Tensor& out,
++    at::Tensor& lse,
+     const at::Tensor& q_nope,
+     const at::Tensor& q_pe,
+     const at::Tensor& kv_c_and_k_pe_cache,
+@@ -47,7 +48,7 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
+     double sm_scale,
+     int64_t num_kv_splits) {
+   runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>>(
+-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
++      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
+       workspace, sm_scale, num_kv_splits);
+ }
+ 
+@@ -59,6 +60,7 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
+ // per .so, so the fixed symbol name never collides across AOT translation units.
+ extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
+     void* out,
++    void* lse,
+     const void* q_nope,
+     const void* q_pe,
+     const void* kv_c_and_k_pe_cache,
+@@ -69,6 +71,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
+     int64_t num_kv_splits) {
+   mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+       *static_cast<at::Tensor*>(out),
++      *static_cast<at::Tensor*>(lse),
+       *static_cast<const at::Tensor*>(q_nope),
+       *static_cast<const at::Tensor*>(q_pe),
+       *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache),
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 298686b..8d0639d 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -368,9 +368,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+   m.def("flash_mla_decode_get_workspace_size", &flash_mla_decode_get_workspace_size);
+ 
+   m.def(
+-      "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
++      "flash_mla_decode(Tensor! out, Tensor! lse, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
+       "Tensor! "
+-      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
++      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits, bool require_lse) -> ()");
+   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
+ 
+   m.def(
+diff --git a/tests/test_flash_mla_decode.py b/tests/test_flash_mla_decode.py
+index 7628afa..786895b 100644
+--- a/tests/test_flash_mla_decode.py
++++ b/tests/test_flash_mla_decode.py
+@@ -1,11 +1,16 @@
+ import gc
++import math
+ import os
+ import sys
+ 
+ import pytest
+ import torch
+ import torch.nn.functional as F
+-from sgl_kernel import flash_mla_decode, flash_mla_decode_get_workspace_size
++from sgl_kernel import (
++    flash_mla_decode,
++    flash_mla_decode_get_workspace_size,
++    flash_mla_get_workspace_size,
++)
+ from torch import Tensor
+ 
+ LONG_TESTS = os.getenv("LONG_TESTS") == "1"
+@@ -152,5 +157,92 @@ def test_flash_mla_decode(
+     del workspace, seq_lens_xpu
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("bs", [1, 4])
++@pytest.mark.parametrize("num_heads", [16, 128])
++@pytest.mark.parametrize("num_kv_splits", [1, 2, 4])
++def test_flash_mla_decode_return_lse(
++    dtype: torch.dtype,
++    bs: int,
++    num_heads: int,
++    num_kv_splits: int,
++):
++    """return_lse=True on both the split-KV and non-split-KV (num_kv_splits=1)
++    paths: lse must match logsumexp(QK^T * scale) in log base 2, matching
++    flash_mla_decode's documented lse convention."""
++    torch.random.manual_seed(0)
++
++    d = 576
++    h_q = num_heads
++    dv = 512
++    mean_seq_len = 4096
++    block_size = 64
++
++    q_nope_dim = 128
++    q_pe_dim = 64
++    scale = (q_nope_dim + q_pe_dim) ** (-0.5)
++    seq_lens_cpu = torch.full((bs,), mean_seq_len, dtype=torch.int32)
++    max_seq_len = seq_lens_cpu.max().item()
++    block_num = (max_seq_len + block_size - 1) // block_size
++    pack_factor = 128 // block_size
++    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
++
++    q_cpu = torch.randn(bs, h_q, d, dtype=dtype, device="cpu") * 100
++    block_table_cpu = torch.randint(
++        0, bs * block_num, (bs, block_num), dtype=torch.int32, device="cpu"
++    )
++    kv_cache_cpu = torch.randn(
++        block_table_cpu.numel(), block_size, d, dtype=dtype, device="cpu"
++    )
++
++    # --- Reference lse: natural-log logsumexp(QK^T * scale), converted to log2 ---
++    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32)
++    for i in range(bs):
++        kv = kv_cache_cpu[block_table_cpu[i]].reshape(1, -1, d)[:, : seq_lens_cpu[i]]
++        kv_f = kv[0].float()
++        for h in range(h_q):
++            q_h = q_cpu[i, h].float()
++            scores = (q_h @ kv_f.T) * scale
++            lse_ref[i, h] = torch.logsumexp(scores, dim=-1) / math.log(2)
++
++    # --- Kernel under test ---
++    q_xpu = q_cpu.to(device=device)
++    kv_cache_xpu = kv_cache_cpu.to(device=device)
++    block_table_xpu = block_table_cpu.to(device=device)
++    seq_lens_xpu = seq_lens_cpu.to(device=device)
++    del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
++
++    workspace_size = flash_mla_get_workspace_size(
++        block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
++    )
++    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
++
++    q_nope = torch.empty((h_q, bs, dv), dtype=dtype, device=device).transpose(0, 1)
++    q_nope.copy_(q_xpu[:, :, :dv])
++    q_pe = q_xpu[:, :, dv:].clone()
++    del q_xpu
++
++    out, lse = flash_mla_decode(
++        q_nope,
++        q_pe,
++        kv_cache_xpu,
++        seq_lens_xpu,
++        block_table_xpu,
++        workspace,
++        scale,
++        num_kv_splits,
++        return_lse=True,
++    )
++    torch.xpu.synchronize()
++
++    assert out.shape == (bs, h_q, dv)
++    assert lse.shape == (bs, h_q)
++    atol, rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
++    torch.testing.assert_close(lse_ref, lse.cpu().float(), atol=atol, rtol=rtol)
++
++    del out, lse, q_nope, q_pe, kv_cache_xpu, block_table_xpu
++    del workspace, seq_lens_xpu
++
++
+ if __name__ == "__main__":
+     sys.exit(pytest.main([__file__]))
+-- 
+2.43.0
+
