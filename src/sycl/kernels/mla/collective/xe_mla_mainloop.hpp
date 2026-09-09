@@ -50,6 +50,11 @@ class XeDefault {};
 
 namespace cutlass::flash_attention::collective {
 using namespace cute;
+
+#ifndef THR_ID
+#define THR_ID 0
+#define BLK_ID 0
+#endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -410,6 +415,13 @@ struct XeMlaMainloop<
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_qnope, tQnopegQ(_, _, _, D), tQnoperQ);
         copy(copy_kv1, tKgK(_, _, _, intra_page_tile_idx, D, physical_block_idx), tKrK);
+        if (cute::thread(THR_ID, BLK_ID)) {
+          cute::print("tQnoperQ = ");
+          cute::print(tQnoperQ);
+          cute::print("\ntKrK = ");
+          cute::print(tKrK);
+          cute::print("\n");
+        }
         reorder(tQnoperQ, tSrQnope);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQnope, tSrK, tSrS);
@@ -591,6 +603,15 @@ struct XeMlaMainloop<
       FragSRow& tS_max,  // Softmax row-wise max accumulator
       FragSRow& tS_sum,  // Softmax row-wise sum accumulator
       FragA& tA) {       // O accumulator (for rescaling)
+    if (cute::thread(THR_ID, BLK_ID)) {
+      cute::print("softmax() called, size(FragS)=");
+      cute::print(size(tS));
+      cute::print(" size(FragSRow)=");
+      cute::print(size(tS_max));
+      cute::print(" size(FragA)=");
+      cute::print(size(tA));
+      cute::print("\n");
+    }
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 

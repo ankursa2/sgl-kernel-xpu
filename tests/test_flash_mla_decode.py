@@ -152,5 +152,64 @@ def test_flash_mla_decode(
     del workspace, seq_lens_xpu
 
 
+def test_mla_decode_debug_trace_page128_seq320():
+    """Minimal decode case for eyeballing the softmax() debug-trace in xe_mla_mainloop.hpp.
+
+    page_size=128, seq_len_kv=320 -> ceil(320/128)=3 K-tiles, so thread(0,0)'s
+    "softmax() called" print should fire exactly 3 times. Run with `pytest -s`
+    to see the trace output.
+    """
+    torch.random.manual_seed(0)
+
+    d = 576
+    dv = 512
+    bs = 1
+    h_q = 1
+    block_size = 128
+    seq_len = 320
+    num_kv_splits = 1
+
+    block_num = (seq_len + block_size - 1) // block_size  # 3
+    scale = (128 + 64) ** (-0.5)
+
+    q_cpu = torch.randn(bs, h_q, d, dtype=torch.bfloat16, device="cpu")
+    block_table_cpu = torch.arange(bs * block_num, dtype=torch.int32).reshape(
+        bs, block_num
+    )
+    kv_cache_cpu = torch.randn(
+        block_table_cpu.numel(), block_size, d, dtype=torch.bfloat16, device="cpu"
+    )
+    seq_lens_cpu = torch.full((bs,), seq_len, dtype=torch.int32)
+
+    q_xpu = q_cpu.to(device=device)
+    kv_cache_xpu = kv_cache_cpu.to(device=device)
+    block_table_xpu = block_table_cpu.to(device=device)
+    seq_lens_xpu = seq_lens_cpu.to(device=device)
+
+    workspace_size = flash_mla_decode_get_workspace_size(
+        block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
+    )
+    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+
+    q_nope = q_xpu[:, :, :dv].clone()
+    q_pe = q_xpu[:, :, dv:].clone()
+
+    out = flash_mla_decode(
+        q_nope,
+        q_pe,
+        kv_cache_xpu,
+        seq_lens_xpu,
+        block_table_xpu,
+        workspace,
+        scale,
+        num_kv_splits,
+    )
+    torch.xpu.synchronize()
+
+    assert out.shape == (bs, h_q, dv)
+
+    del out, q_nope, q_pe, kv_cache_xpu, block_table_xpu, workspace, seq_lens_xpu
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
