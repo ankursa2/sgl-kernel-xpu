@@ -101,7 +101,7 @@ class XeMlaFwdKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
-  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo or ragged row, num_heads_q, batch)
+  using StrideLSE = typename CollectiveEpilogue::StrideLSE;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -363,14 +363,16 @@ class XeMlaFwdKernel {
       float* lse_ptr = nullptr;
       int lse_row_stride = 0;
       if (p.LSE != nullptr) {
-        lse_row_stride = static_cast<int>(get<0>(p.dLSE_out));
-        int64_t lse_offset = static_cast<int64_t>(head_coord) * get<1>(p.dLSE_out) +
-                              static_cast<int64_t>(batch_slice_idx) * get<2>(p.dLSE_out);
-        float* lse_base = p.LSE + lse_offset;
+        auto dcLSE = p.LSE;
         if constexpr (CollectiveMainloop::IsPrefill) {
-          lse_base += static_cast<int64_t>(q_start) * lse_row_stride;
+          dcLSE += static_cast<int64_t>(q_start) * get<0>(p.dLSE_out);
         }
-        lse_ptr = lse_base;
+        // Tensor-indexed like the split-KV gExpSums/gMaxLogits lookup below,
+        // instead of computing the (head,batch) offset by hand.
+        auto shape_LSE = make_shape(seqlen_q_i, s.num_heads_q, batch_dim_size);
+        Tensor LSE = make_tensor(make_gmem_ptr(dcLSE), make_layout(shape_LSE, p.dLSE_out));
+        lse_row_stride = static_cast<int>(get<0>(p.dLSE_out));
+        lse_ptr = &LSE(0, head_coord, batch_slice_idx);
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
@@ -416,7 +418,7 @@ class XeMlaSplitKVKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
-  using StrideLSE = cute::Stride<int, cute::_1, int>;  // (seq_len_qo, num_heads_q, batch)
+  using StrideLSE = typename CollectiveEpilogue::StrideLSE;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;

@@ -60,6 +60,8 @@ class XeMlaEpilogue {
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
+  // (row, num_heads_q, batch); values built in mla_decode_types.hpp/mla_prefill_types.hpp.
+  using StrideLSE = cute::Stride<int, cute::_1, int>;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -157,6 +159,9 @@ class XeMlaEpilogue {
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
+    /* Some subgroups may not have any work to do; if so, quit early. */
+    if (!active) return;
+
     // LSE (log base 2) per row; must be captured before rA_sum is inverted below.
     FragARow rA_lse;
     if (lse_ptr != nullptr) {
@@ -164,9 +169,6 @@ class XeMlaEpilogue {
       for (int i = 0; i < rA_lse.size(); i++)
         rA_lse(i) = ElementA(float(rA_max(i)) + sycl::native::log2(float(rA_sum(i))));
     }
-
-    /* Some subgroups may not have any work to do; if so, quit early. */
-    if (!active) return;
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -208,13 +210,16 @@ class XeMlaEpilogue {
       auto tOrLSE = thr_copy_o.partition_sg_fragment_S(gO);
       reorder(rA_lse_full, tOrLSE);
 
+      // Tensor-indexed write, like the split-KV epilogue's gExpSums/gMaxLogits
+      // lookup, instead of manual pointer/stride arithmetic.
+      Tensor gLSE = make_tensor(make_gmem_ptr(lse_ptr), make_layout(get<0>(O.shape()), lse_row_stride));
+
       int v_tile_start = int(get<1>(blk_qv)) * int(get<1>(TileShapeO{}));
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(tOgO); i++) {
         auto coord = tOgO(i);
         if (int(get<1>(coord)) == v_tile_start) {
-          int q_global = int(get<0>(coord));
-          lse_ptr[q_global * lse_row_stride] = static_cast<float>(tOrLSE(i));
+          gLSE(get<0>(coord)) = static_cast<float>(tOrLSE(i));
         }
       }
     }

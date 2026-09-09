@@ -217,12 +217,30 @@ class XeMlaReduceSplitKV {
       global_max = reduce_over_group(get_work_group<1>(), global_max, sycl::maximum<>());
       global_max = sycl::group_broadcast(get_work_group<1>(), global_max, 0);
 
-      // Step 3: Cooperatively reduce output elements
+      // Step 3: Combine exp_sums once (independent of j) so it isn't redundantly
+      // recomputed every head_size_o/WG_SIZE iteration of the loop below, and
+      // write the combined LSE here rather than inline in the main reduce loop.
+      ElementLSE global_exp_sums = ElementLSE(0);
+      for (int k = 0; k < num_kv_splits; k++) {
+        ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
+        // Skip empty splits (exp_sums=0, max_logits=-inf sentinel)
+        if (local_exp_sum <= ElementLSE(0)) continue;
+
+        ElementLSE local_max = shared_storage.max_logits_slm[k];
+        global_exp_sums += local_exp_sum * sycl::native::exp2(local_max - global_max);
+      }
+      ElementLSE inv_global_exp_sums = ElementLSE(1) / global_exp_sums;
+
+      // lse is log base 2, matching this kernel's exp2-based accumulation.
+      if (thr_id == 0 && p.LSE != nullptr) {
+        LSE(seq_idx, head_q, idx_b) = global_max + sycl::native::log2(global_exp_sums);
+      }
+
+      // Step 4: Cooperatively reduce output elements.
       // O_accum is unnormalized (numerator only),
-      // so acc += O_accum * rescale, and global_exp_sums += exp_sum * rescale.
+      // so acc += O_accum * rescale, then divide by the combined exp_sum above.
       for (int j = thr_id; j < head_size_o; j += WG_SIZE) {
         ElementLSE acc = ElementLSE(0);
-        ElementLSE global_exp_sums = ElementLSE(0);
         for (int k = 0; k < num_kv_splits; k++) {
           ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
           // Skip empty splits (exp_sums=0, max_logits=-inf sentinel)
@@ -236,18 +254,11 @@ class XeMlaReduceSplitKV {
           // O_accum is unnormalized (not divided by exp_sum in epilogue),
           // so multiply by rescale only
           acc += o_val * rescale;
-          global_exp_sums += local_exp_sum * rescale;
         }
 
-        ElementLSE inv_global_exp_sums = ElementLSE(1) / global_exp_sums;
         acc *= inv_global_exp_sums;
 
         O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);
-
-        // lse is log base 2, matching this kernel's exp2-based accumulation.
-        if (j == 0 && p.LSE != nullptr) {
-          LSE(seq_idx, head_q, idx_b) = global_max + sycl::native::log2(global_exp_sums);
-        }
       }
     }
   }
