@@ -46,7 +46,7 @@
 
 namespace cutlass::flash_attention::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
-template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
+template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TensorLSE_, class TiledCopyO_ = void>
 class XeMlaEpilogue {
  public:
   //
@@ -59,6 +59,8 @@ class XeMlaEpilogue {
 
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
+  // (q,) slice of the full (q,head,batch) LSE tensor; same head/batch slicing as O.
+  using TensorLSE = decltype(TensorLSE_{}(append<rank_v<TensorLSE_>>(make_coord(_), 0)));
   using ElementO = typename TensorO_::value_type;
 
   using FragA = typename CollectiveMainloop::FragA;
@@ -141,21 +143,51 @@ class XeMlaEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,        // Global O tensor: (q,v)
+      FragA& tArA,               // O accumulator:   (q,v)
+      FragARow& tA_max,          // Softmax row-wise max accumulator
+      FragARow& tA_sum,          // Softmax row-wise sum accumulator
+      QVCoord blk_qv,            // WG tile indices: (Q,V)
+      int thr_id,                // Work-item ID
+      TensorLSE const& gLSE,     // This (head,batch)'s LSE row: (q,), same slicing as O
+      bool write_lse = false) {  // false = skip (gLSE may be backed by a null pointer)
     using namespace cute;
+    using namespace sycl::ext::oneapi::this_work_item;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    // LSE (log2 units) = row max + log2(row sum); computed here, before the
+    // reciprocal loop below overwrites rA_sum.
+    if (write_lse) {
+      if constexpr (ReduceK{} == _1{}) {
+        // No cross-subgroup K-reduction: each subgroup owns disjoint Q-rows,
+        // so every subgroup's lane 0 must write its own rows. Derive each
+        // row's Q coordinate the same way FragA/FragARow's own layout is
+        // derived (identity tensor + the PV atom's partition_sg_fragment_C),
+        // so index i lines up with rA_sum(i)/rA_max(i).
+        if (get_sub_group().get_local_id()[0] == 0) {
+          Tensor cQV = make_identity_tensor(select<0, 1>(TiledMMAPV{}.tile_mnk()));
+          auto tCoord = TiledMMAPV{}.get_slice(thr_id).partition_sg_fragment_C(cQV);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_sum.size(); i++) {
+            int q_pos = get<0>(blk_qv) * static_cast<int>(get<0>(TileShapeO{})) + get<0>(tCoord(i, 0));
+            gLSE(q_pos) = static_cast<float>(rA_max(i)) + static_cast<float>(sycl::native::log2(float(rA_sum(i))));
+          }
+        }
+      } else {
+        // Cross-subgroup K-reduction: reduce_A elects a single active
+        // subgroup, with thr_id 0 holding the final combined (single) row.
+        if (thr_id == 0) {
+          int q_pos = get<0>(blk_qv) * static_cast<int>(get<0>(TileShapeO{}));
+          gLSE(q_pos) = static_cast<float>(rA_max(0)) + static_cast<float>(sycl::native::log2(float(rA_sum(0))));
+        }
+      }
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL

@@ -129,6 +129,7 @@ struct MlaXe {
   using StrideK = Stride<int, _1, int, int>;
   using StrideV = Stride<_1, int, int, int>;
   using StrideO = Stride<int, _1, int, int>;
+  using StrideLSE = Stride<int, int, int>;
   using GmemTiledCopyQ = void;
   using GmemTiledCopyK = void;
   using GmemTiledCopyV = void;
@@ -154,6 +155,7 @@ struct MlaXe {
   using TensorK = decltype(make_dummy_tensor_type(ElementK{}, StrideK{}));
   using TensorV = decltype(make_dummy_tensor_type(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
+  using TensorLSE = decltype(make_dummy_tensor_type(float{}, StrideLSE{}));
 
   // Collective Mainloop
   static constexpr int PipelineStages = 1;
@@ -175,8 +177,8 @@ struct MlaXe {
                // decode). Prefill defaults to true → 256 GRF.
 
   // Collective Epilogue
-  using CollectiveEpilogue =
-      cutlass::flash_attention::collective::XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+  using CollectiveEpilogue = cutlass::flash_attention::collective::
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, GmemTiledCopyO>;
 
   // Kernel instantiation
   static constexpr bool is_split_kv = SplitKVOption::value;
@@ -193,6 +195,7 @@ struct MlaXe {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -313,6 +316,16 @@ inline typename T::Fmla::Arguments args_from_options(
     kernel_args.max_logits = max_logits_ptr;
     kernel_args.dLSE = stride_lse;
   }
+
+  // Final combined LSE (log base 2), shape (seq_len_qo=1, num_heads_q, batch);
+  // matches the split-KV reduce kernel's output layout. Same tensor/layout
+  // used regardless of split-KV, since decode always has seq_len_qo == 1.
+  kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+  kernel_args.dLSE_out = cute::make_stride(
+      static_cast<int>(problem_shape.num_heads_q * problem_shape.batch),
+      static_cast<int>(1),
+      static_cast<int>(problem_shape.num_heads_q));
+
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
       static_cast<const int*>(page_table.data_ptr()),
@@ -328,6 +341,7 @@ inline typename T::Fmla::Arguments args_from_options(
 template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
 inline void runMlaImpl(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -339,7 +353,7 @@ inline void runMlaImpl(
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -349,6 +363,7 @@ inline void runMlaImpl(
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -379,9 +394,9 @@ inline void runMla(
 
   if (num_kv_splits == 1) {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   }
 }

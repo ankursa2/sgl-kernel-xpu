@@ -126,6 +126,7 @@ struct MlaXePrefill {
   using StrideK = Stride<int, _1, int, int>;
   using StrideV = Stride<_1, int, int, int>;
   using StrideO = Stride<int, _1, int, int>;
+  using StrideLSE = Stride<int, int, int>;
   using GmemTiledCopyQ = void;
   using GmemTiledCopyK = void;
   using GmemTiledCopyV = void;
@@ -151,6 +152,7 @@ struct MlaXePrefill {
   using TensorK = decltype(make_dummy_tensor_type(ElementK{}, StrideK{}));
   using TensorV = decltype(make_dummy_tensor_type(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
+  using TensorLSE = decltype(make_dummy_tensor_type(float{}, StrideLSE{}));
 
   // Collective Mainloop – causal masking enabled for prefill
   static constexpr int PipelineStages = 1;
@@ -169,8 +171,8 @@ struct MlaXePrefill {
       GmemTiledCopyV>;
 
   // Collective Epilogue
-  using CollectiveEpilogue =
-      cutlass::flash_attention::collective::XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+  using CollectiveEpilogue = cutlass::flash_attention::collective::
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, GmemTiledCopyO>;
 
   // Kernel instantiation
   using FmlaKernel = cutlass::flash_attention::kernel::
@@ -194,6 +196,7 @@ struct MlaXePrefill {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -285,6 +288,11 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
   kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
 
+  // Final LSE output: ragged (total_q, num_heads_q), ragged q_start offset
+  // applied per-batch inside the kernel the same way as O/Q_nope.
+  kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+  kernel_args.dLSE_out = cute::make_stride(static_cast<int>(num_heads), static_cast<int>(1), static_cast<int>(0));
+
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
       static_cast<const int*>(page_table.data_ptr()),
@@ -299,6 +307,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
 template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -314,6 +323,7 @@ inline void runMlaPrefill(
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
       out,
+      lse,
       q_nope,
       q_pe,
       kv_c_and_k_pe_cache,

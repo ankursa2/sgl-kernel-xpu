@@ -150,6 +150,10 @@ class XeMlaFwdKernel {
     // When nullptr, Q is fixed-shape (decode or old-style prefill).
     const int* cu_seqlens_q = nullptr;
 
+    // Final LSE output (optional): (seq_len_qo, num_heads_q, batch). nullptr = don't compute/write.
+    float* LSE = nullptr;
+    cute::Stride<int, int, int> dLSE_out{};
+
     // Default constructor
     KernelArguments() = default;
   };
@@ -287,6 +291,16 @@ class XeMlaFwdKernel {
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
       Tensor O = make_tensor(make_gmem_ptr(dO_ptr), make_layout(shape_O, p.dO));
 
+      // LSE output (optional): same ragged q_start offset as O for varlen prefill.
+      auto dcLSE = p.LSE;
+      if constexpr (CollectiveMainloop::IsPrefill) {
+        if (p.LSE != nullptr) {
+          dcLSE += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
+        }
+      }
+      auto shape_LSE = make_shape(seqlen_q_i, s.num_heads_q, batch_dim_size);
+      Tensor LSE = make_tensor(make_gmem_ptr(dcLSE), make_layout(shape_LSE, p.dLSE_out));
+
       // O accumulator types
       FragA tArA;
       FragARow tA_max, tA_sum;
@@ -356,7 +370,15 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      epilogue(
+          O(_, _, head_coord, batch_slice_idx),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          thr_id,
+          LSE(_, head_coord, batch_slice_idx),
+          p.LSE != nullptr);
     }
   }
 };
@@ -455,6 +477,11 @@ class XeMlaSplitKVKernel {
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;
+
+    // Final combined LSE output (optional): not written by this kernel, only
+    // passed through to the downstream XeMlaReduceSplitKV reduction kernel.
+    ElementAcc* LSE = nullptr;
+    cute::Stride<int, int, int> dLSE_out{};
 
     KernelArguments() = default;
   };
