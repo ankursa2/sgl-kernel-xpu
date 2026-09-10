@@ -46,7 +46,7 @@
 
 namespace cutlass::flash_attention::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
-template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
+template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TensorLSEOut_, class TiledCopyO_ = void>
 class XeMlaEpilogue {
  public:
   //
@@ -60,6 +60,9 @@ class XeMlaEpilogue {
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
+  using TensorLSEOut = TensorLSEOut_;
+  using TensorLSEOut1D = decltype(TensorLSEOut_{}(append<rank_v<TensorLSEOut_>>(make_coord(_), 0)));
+  using ElementLSEOut = typename TensorLSEOut_::value_type;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -146,16 +149,58 @@ class XeMlaEpilogue {
       FragARow& tA_max,    // Softmax row-wise max accumulator
       FragARow& tA_sum,    // Softmax row-wise sum accumulator
       QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      int thr_id,          // Work-item ID
+      TensorLSEOut1D const& LSE_out) {  // Current head/batch LSE slice: (q)
     using namespace cute;
+    using namespace sycl::ext::oneapi::this_work_item;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    // LSE_out = row_max + log2(row_sum). This must happen before
+    // rA_sum is replaced by its reciprocal below.
+    if constexpr (ReduceK{} == _1{}) {
+      // Each subgroup owns distinct Q rows. Lane 0 writes those rows.
+      if (get_sub_group().get_local_id()[0] == 0) {
+        Tensor cQV =
+            make_identity_tensor(select<0, 1>(TiledMMAPV{}.tile_mnk()));
+        auto tCoord =
+          TiledMMAPV{}.get_slice(thr_id).partition_C(cQV);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA_sum.size(); ++i) {
+          int q_pos =
+              get<0>(blk_qv) *
+                  static_cast<int>(get<0>(TileShapeO{})) +
+                get<0>(tCoord(i));
+
+          if (q_pos < size<0>(LSE_out)) {
+            LSE_out(q_pos) =
+                static_cast<ElementLSEOut>(rA_max(i)) +
+                sycl::native::log2(
+                    static_cast<ElementLSEOut>(rA_sum(i)));
+          }
+        }
+      }
+    } else {
+      // After cross-subgroup K reduction, thread 0 owns the final row.
+      if (thr_id == 0) {
+        int q_pos =
+            get<0>(blk_qv) *
+            static_cast<int>(get<0>(TileShapeO{}));
+
+        if (q_pos < size<0>(LSE_out)) {
+          LSE_out(q_pos) =
+              static_cast<ElementLSEOut>(rA_max(0)) +
+              sycl::native::log2(
+                  static_cast<ElementLSEOut>(rA_sum(0)));
+        }
+      }
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL

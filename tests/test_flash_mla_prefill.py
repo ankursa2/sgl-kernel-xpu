@@ -223,7 +223,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
     workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
 
-    out = flash_mla_prefill(
+    out, lse = flash_mla_prefill(
         q_nope_xpu,
         q_pe_xpu,
         kv_cache_xpu,
@@ -240,6 +240,9 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
 
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+    assert lse.shape == (total_q, num_heads)
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(lse).all()
 
 
 if __name__ == "__main__":

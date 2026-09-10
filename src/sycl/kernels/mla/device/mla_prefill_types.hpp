@@ -118,6 +118,7 @@ struct MlaXePrefill {
   using ElementK = ElementType;
   using ElementV = ElementType;
   using ElementO = ElementType;
+  using ElementLSEOut = float;
 
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>;
@@ -126,6 +127,7 @@ struct MlaXePrefill {
   using StrideK = Stride<int, _1, int, int>;
   using StrideV = Stride<_1, int, int, int>;
   using StrideO = Stride<int, _1, int, int>;
+  using StrideLSEOut = Stride<int, int, int>;
   using GmemTiledCopyQ = void;
   using GmemTiledCopyK = void;
   using GmemTiledCopyV = void;
@@ -151,6 +153,7 @@ struct MlaXePrefill {
   using TensorK = decltype(make_dummy_tensor_type(ElementK{}, StrideK{}));
   using TensorV = decltype(make_dummy_tensor_type(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
+  using TensorLSEOut = decltype(make_dummy_tensor_type(ElementLSEOut{}, StrideLSEOut{}));
 
   // Collective Mainloop – causal masking enabled for prefill
   static constexpr int PipelineStages = 1;
@@ -169,8 +172,12 @@ struct MlaXePrefill {
       GmemTiledCopyV>;
 
   // Collective Epilogue
-  using CollectiveEpilogue =
-      cutlass::flash_attention::collective::XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+    using CollectiveEpilogue = cutlass::flash_attention::collective::XeMlaEpilogue<
+      CollectiveMainloop,
+      TileShapeOutput,
+      TensorO,
+      TensorLSEOut,
+      GmemTiledCopyO>;
 
   // Kernel instantiation
   using FmlaKernel = cutlass::flash_attention::kernel::
@@ -194,6 +201,7 @@ struct MlaXePrefill {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& out,
+  at::Tensor const& lse_out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -240,6 +248,8 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   using ElementQ = typename T::ElementQ;
   using ElementK = typename T::ElementK;
   using ElementO = typename T::ElementO;
+  using ElementLSEOut = typename T::ElementLSEOut;
+  using StrideLSEOut = typename T::StrideLSEOut;
 
   // Ragged 3D Q strides mapped to kernel's 4D layout (seq, dim, head, batch):
   //   dim0 = seq  -> q_nope.stride(0) = H * D
@@ -269,6 +279,9 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   StrideO stride_O = cute::make_stride(
       static_cast<int>(out.stride(0)), cute::_1{}, static_cast<int>(out.stride(1)), static_cast<int>(0));
 
+    StrideLSEOut stride_LSE_out = cute::make_stride(
+      static_cast<int>(lse_out.stride(0)), static_cast<int>(lse_out.stride(1)), static_cast<int>(0));
+
   typename T::Fmla::KernelArguments kernel_args{};
   kernel_args.shape = problem_shape;
   kernel_args.Q_nope = static_cast<const ElementQ*>(q_nope.data_ptr());
@@ -282,6 +295,8 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
+  kernel_args.LSE_out = static_cast<ElementLSEOut*>(lse_out.data_ptr());
+  kernel_args.dLSE_out = stride_LSE_out;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
   kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
 
@@ -299,6 +314,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
 template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor const& out,
+  at::Tensor const& lse_out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -314,6 +330,7 @@ inline void runMlaPrefill(
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
       out,
+      lse_out,
       q_nope,
       q_pe,
       kv_c_and_k_pe_cache,

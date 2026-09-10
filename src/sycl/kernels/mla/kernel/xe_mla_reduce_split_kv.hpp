@@ -79,6 +79,8 @@ class XeMlaReduceSplitKV {
   using SGPerWG = typename MlaKernel_::SGPerWG;
 
   using ElementLSE = float;  // exp_sums/max_logits accumulator type
+  using ElementLSEOut = typename MlaKernel_::ElementLSEOut;
+  using StrideLSEOut = typename MlaKernel_::StrideLSEOut;
 
   // Number of output values processed by each thread
   static constexpr int num_vals_per_thread = int(get<1>(TileShapeO{}) / (SGPerWG::value * intel::sg_size));
@@ -98,6 +100,9 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
+    // Final combined LSE output
+    ElementLSEOut* LSE_out = nullptr;
+    StrideLSEOut dLSE_out{};
   };
   //
   // KernelParams
@@ -180,6 +185,7 @@ class XeMlaReduceSplitKV {
     auto shape_Oaccum = make_shape(seq_len_qo, head_size_o, num_heads_q * num_kv_splits, batch);
     auto shape_exp_sums = make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch);
     auto shape_max_logits = make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch);
+    auto shape_LSE_out = make_shape(seq_len_qo, num_heads_q, batch);
 
     Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));
     Tensor Oaccum = make_tensor(make_gmem_ptr(const_cast<ElementO*>(p.O_accum)), make_layout(shape_Oaccum, p.dO_accum));
@@ -187,6 +193,7 @@ class XeMlaReduceSplitKV {
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.exp_sums)), make_layout(shape_exp_sums, p.dLSE));
     Tensor max_logits =
         make_tensor(make_gmem_ptr(const_cast<ElementLSE*>(p.max_logits)), make_layout(shape_max_logits, p.dLSE));
+    Tensor LSE_out = make_tensor(make_gmem_ptr(p.LSE_out), make_layout(shape_LSE_out, p.dLSE_out));
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -212,12 +219,25 @@ class XeMlaReduceSplitKV {
       global_max = reduce_over_group(get_work_group<1>(), global_max, sycl::maximum<>());
       global_max = sycl::group_broadcast(get_work_group<1>(), global_max, 0);
 
-      // Step 3: Cooperatively reduce output elements
-      // O_accum is unnormalized (numerator only),
-      // so acc += O_accum * rescale, and global_exp_sums += exp_sum * rescale.
+      // Step 3: Combine split sums once for this attention row.
+      ElementLSE global_exp_sums = ElementLSE(0);
+      for (int k = 0; k < num_kv_splits; k++) {
+        ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
+        if (local_exp_sum <= ElementLSE(0)) continue;
+        ElementLSE local_max = shared_storage.max_logits_slm[k];
+        global_exp_sums += local_exp_sum * sycl::native::exp2(local_max - global_max);
+      }
+
+      if (thr_id == 0) {
+        LSE_out(seq_idx, head_q, idx_b) =
+            static_cast<ElementLSEOut>(global_max + sycl::native::log2(global_exp_sums));
+      }
+
+      ElementLSE inv_global_exp_sums = ElementLSE(1) / global_exp_sums;
+
+      // Step 4: Cooperatively reduce output elements.
       for (int j = thr_id; j < head_size_o; j += WG_SIZE) {
         ElementLSE acc = ElementLSE(0);
-        ElementLSE global_exp_sums = ElementLSE(0);
         for (int k = 0; k < num_kv_splits; k++) {
           ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
           // Skip empty splits (exp_sums=0, max_logits=-inf sentinel)
@@ -231,10 +251,8 @@ class XeMlaReduceSplitKV {
           // O_accum is unnormalized (not divided by exp_sum in epilogue),
           // so multiply by rescale only
           acc += o_val * rescale;
-          global_exp_sums += local_exp_sum * rescale;
         }
 
-        ElementLSE inv_global_exp_sums = ElementLSE(1) / global_exp_sums;
         acc *= inv_global_exp_sums;
 
         O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);

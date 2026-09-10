@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -60,7 +60,8 @@ def flash_mla_decode(
     workspace: torch.Tensor,
     sm_scale: float,
     num_kv_splits: int = 1,
-) -> torch.Tensor:
+    return_lse: bool = True,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
     assert (
@@ -117,9 +118,11 @@ def flash_mla_decode(
         if device_type == "xpu"
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
+    lse_out = torch.empty((B_q, H), dtype=torch.float32, device=q_nope.device)
 
     torch.ops.sgl_kernel.flash_mla_decode.default(
         out,
+        lse_out,
         q_nope,
         q_pe,
         kv_c_and_k_pe_cache,
@@ -129,7 +132,8 @@ def flash_mla_decode(
         sm_scale,
         num_kv_splits,
     )
-    return out if device_type == "xpu" else out[:, :H].contiguous()
+    out = out if device_type == "xpu" else out[:, :H].contiguous()
+    return (out, lse_out) if return_lse else out
 
 
 def flash_mla_get_workspace_size(
@@ -170,7 +174,8 @@ def flash_mla_prefill(
     sm_scale: float,
     causal: bool = True,
     num_kv_splits: int = -1,
-) -> torch.Tensor:
+    return_lse: bool = True,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """MLA prefill with varlen/ragged Q and causal masking.
 
     Supports full prefill (seqlen_q == seqlen_k) and incremental prefill
@@ -227,9 +232,11 @@ def flash_mla_prefill(
     _Q_TILE_MAX = 256
     total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
     out = q_nope.new_empty((total_q_padded, H, D_latent))
+    lse_out = torch.empty((total_q, H), dtype=torch.float32, device=q_nope.device)
 
     torch.ops.sgl_kernel.flash_mla_prefill.default(
         out,
+        lse_out,
         q_nope.contiguous(),
         q_pe.contiguous(),
         kv_c_and_k_pe_cache,
@@ -242,7 +249,8 @@ def flash_mla_prefill(
         causal,
         num_kv_splits,
     )
-    return out[:total_q]
+    out = out[:total_q]
+    return (out, lse_out) if return_lse else out
 
 
 def flash_mla_prefill_get_workspace_size(

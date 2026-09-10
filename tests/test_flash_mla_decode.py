@@ -45,6 +45,7 @@ def ref_mla(
 ):
     bs, num_heads, v_head_dim = out.shape
     head_dim = query.shape[2]
+    lse = torch.empty(bs, num_heads, dtype=torch.float32)
 
     # Decode has a single query position, so attention reduces to two matmuls
     # over all heads at once. Doing this instead of one SDPA call per head
@@ -56,10 +57,12 @@ def ref_mla(
         v = kv[:, :v_head_dim]  # (seq_len, v_head_dim)
 
         # (num_heads, head_dim) @ (head_dim, seq_len) -> (num_heads, seq_len)
-        probs = ((query[i].float() @ kv.transpose(0, 1)) * scale).softmax(dim=-1)
+        scores = (query[i].float() @ kv.transpose(0, 1)) * scale
+        probs = scores.softmax(dim=-1)
         out[i] = (probs @ v).to(out.dtype)  # (num_heads, v_head_dim)
+        lse[i] = torch.logsumexp(scores, dim=-1) * torch.log2(torch.tensor(torch.e))
 
-    return out
+    return out, lse
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -116,7 +119,7 @@ def test_flash_mla_decode(
 
     # --- Reference: run on CPU ---
     out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
-    ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu)
+    out_ref, lse_ref = ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu)
 
     # --- Kernel under test: run on XPU ---
     q_xpu = q_cpu.to(device=device)
@@ -134,7 +137,7 @@ def test_flash_mla_decode(
     q_nope.copy_(q_xpu[:, :, :dv])
     q_pe = q_xpu[:, :, dv:].clone()
     del q_xpu
-    out = flash_mla_decode(
+    out, lse = flash_mla_decode(
         q_nope,
         q_pe,
         kv_cache_xpu,
@@ -147,8 +150,9 @@ def test_flash_mla_decode(
     torch.xpu.synchronize()
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=atol, rtol=rtol)
 
-    del out, out_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
+    del out, out_ref, lse, lse_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
     del workspace, seq_lens_xpu
 
 
