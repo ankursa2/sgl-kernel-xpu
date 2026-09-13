@@ -139,9 +139,53 @@ class XeMlaEpilogue {
     return true;
   }
 
-  template <typename QVCoord>
+ private:
+    template <typename AccumFragment, typename RowFragment, typename QVCoord, typename TensorLSE>
+  CUTLASS_DEVICE void store_lse_base2(
+      AccumFragment const& rA,
+      RowFragment const& rA_sum,
+      RowFragment const& rA_max,
+      QVCoord blk_qv,
+      int thr_id,
+      TensorLSE const& LSE) {
+    using namespace cute;
+
+    if (int(get<1>(blk_qv)) != 0) return;
+
+    if constexpr (CollectiveMainloop::IsPrefill) {
+      constexpr int rows_per_sg = int(get<0>(SGTileShapeA{}));
+      static_assert(rows_per_sg == 8, "Dense MLA prefill LSE mapping requires eight Q rows per subgroup");
+      static_assert(
+          rows_per_sg * SGPerWG::value == int(get<0>(TileShapeO{})),
+          "Dense MLA prefill LSE mapping requires subgroups to partition the Q dimension");
+
+      int sg_id = thr_id / intel::sg_size;
+      int lane_id = thr_id % intel::sg_size;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); ++i) {
+        auto coord = rA.tv_layout()(lane_id, i);
+        if (int(get<1>(coord)) != 0) continue;
+
+        int row = int(get<0>(blk_qv)) * int(get<0>(TileShapeO{})) + sg_id * rows_per_sg + int(get<0>(coord));
+        if (row < size(LSE)) {
+          float sum = static_cast<float>(broadcast<0>(rA_sum, rA, i));
+          float row_max = static_cast<float>(broadcast<0>(rA_max, rA, i));
+          LSE(row) = sum > 0.0f ? row_max + sycl::native::log2(sum) : -INFINITY;
+        }
+      }
+    } else if (thr_id == 0) {
+      float sum = static_cast<float>(rA_sum(0));
+      LSE(0) = sum > 0.0f ? static_cast<float>(rA_max(0)) + sycl::native::log2(sum) : -INFINITY;
+    }
+  }
+
+ public:
+
+    template <typename TensorLSE, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorO2D const& O,  // Global O tensor: (q,v)
+      TensorLSE const& LSE,  // Global LSE tensor: (q)
       FragA& tArA,         // O accumulator:   (q,v)
       FragARow& tA_max,    // Softmax row-wise max accumulator
       FragARow& tA_sum,    // Softmax row-wise sum accumulator
@@ -151,22 +195,10 @@ class XeMlaEpilogue {
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
-
-    /* Complete softmax, dividing out sums. */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++) {
-      auto val = broadcast<0>(rA_sum, rA, i);
-      rA(i) *= val;
-    }
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
@@ -178,6 +210,19 @@ class XeMlaEpilogue {
 
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
+
+    store_lse_base2(rA, rA_sum, rA_max, blk_qv, thr_id, LSE);
+
+    /* Complete softmax, dividing out sums. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++)
+      rA_sum(i) = ElementA(1) / rA_sum(i);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      auto val = broadcast<0>(rA_sum, rA, i);
+      rA(i) *= val;
+    }
 
     /* Reorder tile and write out */
     reorder(rA, tOrO);

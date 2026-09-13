@@ -194,6 +194,7 @@ struct MlaXePrefill {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& out,
+    at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -282,6 +283,8 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
+  kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+  kernel_args.lse_stride_q = lse.stride(0);
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
   kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
 
@@ -299,6 +302,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
 template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor const& out,
+  at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -314,6 +318,7 @@ inline void runMlaPrefill(
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
       out,
+      lse,
       q_nope,
       q_pe,
       kv_c_and_k_pe_cache,

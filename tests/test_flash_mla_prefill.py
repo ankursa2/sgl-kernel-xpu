@@ -38,7 +38,7 @@ def ref_mla_prefill_varlen(
     cu_seqlens_q: Tensor,  # (B+1,) int32
     seq_lens_k: Tensor,  # (B,) int32
     causal: bool = True,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     """Pure-PyTorch reference for varlen MLA prefill with causal mask."""
     batch_size = seq_lens_k.shape[0]
     H = q_nope.shape[1]
@@ -48,6 +48,7 @@ def ref_mla_prefill_varlen(
     total_q = q_nope.shape[0]
 
     out = torch.zeros(total_q, H, D_latent, dtype=q_nope.dtype)
+    lse = torch.empty(total_q, H, dtype=torch.float32)
 
     for b in range(batch_size):
         q_start = cu_seqlens_q[b].item()
@@ -83,6 +84,13 @@ def ref_mla_prefill_varlen(
         else:
             attn_mask = None
 
+        scores = (q_full.float() @ k_full.float().transpose(0, 1)) * scale
+        if attn_mask is not None:
+            scores += attn_mask
+        lse[q_start:q_end] = (
+            torch.logsumexp(scores, dim=-1) * torch.log2(torch.tensor(torch.e))
+        ).transpose(0, 1)
+
         o = F.scaled_dot_product_attention(
             q_full,  # (H, seqlen_q, D_ckv)
             k_full.unsqueeze(0),  # (1, seqlen_k, D_ckv) — broadcast over heads
@@ -93,7 +101,84 @@ def ref_mla_prefill_varlen(
 
         out[q_start:q_end] = o.permute(1, 0, 2)
 
-    return out
+    return out, lse
+
+
+@pytest.mark.parametrize(
+    "seqlens_q,page_table_k_len",
+    [
+        pytest.param([5, 37], 64, id="small_partial_packed"),
+        pytest.param([9, 257], 320, id="medium_partial_packed"),
+        pytest.param([512], 1024, id="large_two_tiles"),
+    ],
+)
+def test_mla_prefill_lse_row_mapping(seqlens_q, page_table_k_len):
+    """Each causal row must receive its own base-2 LSE exactly once."""
+    dtype = torch.bfloat16
+    block_size = 16
+    num_heads = 16
+    D_latent = 512
+    D_rope = 64
+    D_ckv = D_latent + D_rope
+    scale = (128 + D_rope) ** (-0.5)
+
+    batch_size = len(seqlens_q)
+    total_q = sum(seqlens_q)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
+        dtype=torch.int32,
+        device=device,
+    )
+    seq_lens_k = torch.tensor(seqlens_q, dtype=torch.int32, device=device)
+
+    page_table_cols = (page_table_k_len + block_size - 1) // block_size
+    pack_factor = 128 // block_size
+    page_table_cols = (
+        (page_table_cols + pack_factor - 1) // pack_factor * pack_factor
+    )
+    page_table = torch.zeros(
+        batch_size, page_table_cols, dtype=torch.int32, device=device
+    )
+
+    q_nope = torch.zeros(total_q, num_heads, D_latent, dtype=dtype)
+    head_factors = torch.arange(1, num_heads + 1, dtype=torch.float32) / num_heads
+    q_nope[:, :, 0] = head_factors.to(dtype)
+    q_pe = torch.zeros(total_q, num_heads, D_rope, dtype=dtype, device=device)
+    kv_cache = torch.zeros(1, block_size, D_ckv, dtype=dtype)
+    key_factors = torch.arange(block_size, dtype=torch.float32) / block_size
+    kv_cache[0, :, 0] = key_factors.to(dtype)
+    workspace_size = flash_mla_prefill_get_workspace_size(
+        page_table_cols * block_size, batch_size
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+
+    _, lse = flash_mla_prefill(
+        q_nope.to(device),
+        q_pe,
+        kv_cache.to(device),
+        cu_seqlens_q,
+        seq_lens_k,
+        max(seqlens_q),
+        page_table,
+        workspace,
+        scale,
+        causal=True,
+        num_kv_splits=1,
+    )
+    torch.xpu.synchronize()
+
+    expected_rows = []
+    for seqlen_q in seqlens_q:
+        keys = key_factors[torch.arange(seqlen_q) % block_size]
+        scores = head_factors[:, None] * keys[None, :] * scale
+        expected_rows.append(
+            torch.stack(
+                [torch.logsumexp(scores[:, : row + 1], dim=-1) for row in range(seqlen_q)]
+            )
+            * torch.log2(torch.tensor(torch.e))
+        )
+    expected_lse = torch.cat(expected_rows)
+    torch.testing.assert_close(lse.cpu(), expected_lse, atol=1e-2, rtol=1e-2)
 
 
 # ============================================================================
@@ -202,7 +287,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
     )
 
-    out_ref = ref_mla_prefill_varlen(
+    out_ref, lse_ref = ref_mla_prefill_varlen(
         q_nope_cpu,
         q_pe_cpu,
         kv_cache_cpu,
@@ -223,7 +308,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
     workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
 
-    out = flash_mla_prefill(
+    out, lse = flash_mla_prefill(
         q_nope_xpu,
         q_pe_xpu,
         kv_cache_xpu,
@@ -240,6 +325,24 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
 
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=atol, rtol=rtol)
+
+    if dtype == torch.bfloat16 and block_size == 16 and num_heads == 16 and seqlens_q == [16]:
+        out_only = flash_mla_prefill(
+            q_nope_xpu,
+            q_pe_xpu,
+            kv_cache_xpu,
+            cu_seqlens_q_xpu,
+            seq_lens_k_xpu,
+            max(seqlens_q),
+            block_table_xpu,
+            workspace,
+            scale,
+            causal=True,
+            num_kv_splits=1,
+            return_lse=False,
+        )
+        assert isinstance(out_only, torch.Tensor)
 
 
 if __name__ == "__main__":

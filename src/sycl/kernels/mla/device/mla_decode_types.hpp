@@ -193,6 +193,7 @@ struct MlaXe {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& out,
+  at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -285,6 +286,8 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
+  kernel_args.LSE = static_cast<float*>(lse.data_ptr());
+  kernel_args.lse_stride_q = lse.stride(0);
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
 
   if constexpr (T::is_split_kv) {
@@ -328,6 +331,7 @@ inline typename T::Fmla::Arguments args_from_options(
 template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
 inline void runMlaImpl(
     at::Tensor const& out,
+  at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -339,7 +343,7 @@ inline void runMlaImpl(
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -349,6 +353,7 @@ inline void runMlaImpl(
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
     at::Tensor const& out,
+  at::Tensor const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -379,9 +384,9 @@ inline void runMla(
 
   if (num_kv_splits == 1) {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   }
 }

@@ -91,6 +91,8 @@ class XeMlaReduceSplitKV {
     // Final output
     ElementO* O = nullptr;
     StrideO dO{};
+    ElementLSE* LSE = nullptr;
+    int64_t lse_stride_q = 0;
     // Partial outputs from split kernel
     const ElementO* O_accum = nullptr;
     StrideO dO_accum{};
@@ -211,6 +213,18 @@ class XeMlaReduceSplitKV {
       // Step 2: Find global max across all splits via HW group reduction
       global_max = reduce_over_group(get_work_group<1>(), global_max, sycl::maximum<>());
       global_max = sycl::group_broadcast(get_work_group<1>(), global_max, 0);
+
+      if (thr_id == 0) {
+        ElementLSE global_exp_sums = ElementLSE(0);
+        for (int k = 0; k < num_kv_splits; k++) {
+          ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
+          if (local_exp_sum <= ElementLSE(0)) continue;
+          ElementLSE local_max = shared_storage.max_logits_slm[k];
+          global_exp_sums += local_exp_sum * sycl::native::exp2(local_max - global_max);
+        }
+        p.LSE[static_cast<int64_t>(idx_b) * p.lse_stride_q + head_q] =
+          global_exp_sums > ElementLSE(0) ? global_max + sycl::native::log2(global_exp_sums) : -INFINITY;
+      }
 
       // Step 3: Cooperatively reduce output elements
       // O_accum is unnormalized (numerator only),

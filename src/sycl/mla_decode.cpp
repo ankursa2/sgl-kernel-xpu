@@ -100,19 +100,19 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
     switch (page_size) {                                                                                       \
       case 16:                                                                                                 \
         mla_decode::launch_mla_decode_##ELEM##_16(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
         break;                                                                                                 \
       case 32:                                                                                                 \
         mla_decode::launch_mla_decode_##ELEM##_32(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
         break;                                                                                                 \
       case 64:                                                                                                 \
         mla_decode::launch_mla_decode_##ELEM##_64(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
         break;                                                                                                 \
       case 128:                                                                                                \
         mla_decode::launch_mla_decode_##ELEM##_128(                                                            \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
         break;                                                                                                 \
       default:                                                                                                 \
         TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size);                               \
@@ -137,6 +137,7 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 /// @brief Dispatch kernel implementation for MLA decode.
 SGL_KERNEL_EXPORT void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
+  at::Tensor& lse,                        // (batch, num_heads)
     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
@@ -146,12 +147,19 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
     double sm_scale,  // softmax scale
     int64_t num_kv_splits) {
   CHECK_INPUT(out);
+  CHECK_INPUT(lse);
   CHECK_INPUT(q_nope);
   CHECK_INPUT(q_pe);
   CHECK_INPUT(kv_c_and_k_pe_cache);
   CHECK_INPUT(seq_lens);
   CHECK_INPUT(page_table);
   CHECK_INPUT(workspace);
+
+  TORCH_CHECK(lse.scalar_type() == at::ScalarType::Float, "lse must have dtype float32");
+  TORCH_CHECK(lse.device() == q_nope.device(), "lse must be on the same device as q_nope");
+  TORCH_CHECK(
+      lse.dim() == 2 && lse.size(0) == q_nope.size(0) && lse.size(1) == q_nope.size(1),
+      "lse must have shape (batch, num_heads)");
 
   int page_size = kv_c_and_k_pe_cache.size(1);
 
@@ -182,6 +190,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
             in_dtype == at::ScalarType::Half,
             page_size,
             &out,
+            &lse,
             &q_nope,
             &q_pe,
             &kv_c_and_k_pe_cache,

@@ -142,6 +142,8 @@ class XeMlaFwdKernel {
     // output tensor
     ElementO* O = nullptr;
     StrideO dO{};
+    float* LSE = nullptr;
+    int64_t lse_stride_q = 0;
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;
@@ -272,6 +274,7 @@ class XeMlaFwdKernel {
       auto dcQ_nope = const_cast<ElementQ*>(p.Q_nope);
       auto dcQ_pe = const_cast<ElementQ*>(p.Q_pe);
       auto dO_ptr = p.O;
+      auto lse_ptr = p.LSE + static_cast<int64_t>(batch_coord) * p.lse_stride_q + head_coord;
 
       if constexpr (CollectiveMainloop::IsPrefill) {
         // int64 to avoid overflow on large total_q
@@ -281,11 +284,14 @@ class XeMlaFwdKernel {
         dcQ_nope += q_nope_offset;
         dcQ_pe += q_pe_offset;
         dO_ptr += o_offset;
+        lse_ptr = p.LSE + static_cast<int64_t>(q_start) * p.lse_stride_q + head_coord;
       }
 
       Tensor Q_nope = make_tensor(make_gmem_ptr(dcQ_nope), make_layout(shape_Q_nope, p.dQ_nope));
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
       Tensor O = make_tensor(make_gmem_ptr(dO_ptr), make_layout(shape_O, p.dO));
+        Tensor LSE = make_tensor(
+          make_gmem_ptr(lse_ptr), make_layout(make_shape(seqlen_q_i), make_stride(p.lse_stride_q)));
 
       // O accumulator types
       FragA tArA;
@@ -356,7 +362,14 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        epilogue(
+          O(_, _, head_coord, batch_slice_idx),
+          LSE,
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          thr_id);
     }
   }
 };
@@ -452,6 +465,8 @@ class XeMlaSplitKVKernel {
     // Final output
     ElementO* O = nullptr;
     StrideO dO{};
+    ElementAcc* LSE = nullptr;
+    int64_t lse_stride_q = 0;
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;

@@ -163,6 +163,8 @@ class MLA {
       reduce_kernel_args.shape = s;
       reduce_kernel_args.O = args.kernel.O;
       reduce_kernel_args.dO = args.kernel.dO;
+      reduce_kernel_args.LSE = args.kernel.LSE;
+      reduce_kernel_args.lse_stride_q = args.kernel.lse_stride_q;
       reduce_kernel_args.O_accum = args.kernel.O_accum;
       reduce_kernel_args.dO_accum = args.kernel.dO_accum;
       reduce_kernel_args.exp_sums = args.kernel.exp_sums;

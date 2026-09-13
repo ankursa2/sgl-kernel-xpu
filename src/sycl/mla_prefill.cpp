@@ -102,6 +102,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 16:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_16_##BUCKET(                     \
             out,                                                                  \
+          lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -117,6 +118,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 32:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_32_##BUCKET(                     \
             out,                                                                  \
+          lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -132,6 +134,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 64:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_64_##BUCKET(                     \
             out,                                                                  \
+          lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -147,6 +150,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 128:                                                                   \
         mla_prefill::launch_mla_prefill_##ELEM##_128_##BUCKET(                    \
             out,                                                                  \
+          lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -183,6 +187,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
+  at::Tensor& lse,                        // (total_q, num_heads)
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_pages, page_size, latent_dim + rope_dim)
@@ -195,6 +200,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
     bool causal,
     int64_t num_kv_splits) {
   CHECK_INPUT(out);
+  CHECK_INPUT(lse);
   CHECK_INPUT(q_nope);
   CHECK_INPUT(q_pe);
   CHECK_INPUT(kv_c_and_k_pe_cache);
@@ -202,6 +208,12 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
   CHECK_INPUT(seq_lens);
   CHECK_INPUT(page_table);
   CHECK_INPUT(workspace);
+
+  TORCH_CHECK(lse.scalar_type() == at::ScalarType::Float, "lse must have dtype float32");
+  TORCH_CHECK(lse.device() == q_nope.device(), "lse must be on the same device as q_nope");
+  TORCH_CHECK(
+      lse.dim() == 2 && lse.size(0) == q_nope.size(0) && lse.size(1) == q_nope.size(1),
+      "lse must have shape (total_q, num_heads)");
 
   int page_size = kv_c_and_k_pe_cache.size(1);
 
@@ -259,6 +271,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             page_size,
             bucket_id,
             &out,
+            &lse,
             &q_nope,
             &q_pe,
             &kv_c_and_k_pe_cache,
