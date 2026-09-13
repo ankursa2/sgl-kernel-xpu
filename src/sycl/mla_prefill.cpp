@@ -102,6 +102,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 16:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_16_##BUCKET(                     \
             out,                                                                  \
+            lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -117,6 +118,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 32:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_32_##BUCKET(                     \
             out,                                                                  \
+            lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -132,6 +134,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 64:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_64_##BUCKET(                     \
             out,                                                                  \
+            lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -147,6 +150,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
       case 128:                                                                   \
         mla_prefill::launch_mla_prefill_##ELEM##_128_##BUCKET(                    \
             out,                                                                  \
+            lse,                                                                  \
             q_nope,                                                               \
             q_pe,                                                                 \
             kv_c_and_k_pe_cache,                                                  \
@@ -183,6 +187,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
+    at::Tensor& lse,                        // (total_q, num_heads), log base 2
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_pages, page_size, latent_dim + rope_dim)
@@ -195,6 +200,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
     bool causal,
     int64_t num_kv_splits) {
   CHECK_INPUT(out);
+  CHECK_INPUT(lse);
   CHECK_INPUT(q_nope);
   CHECK_INPUT(q_pe);
   CHECK_INPUT(kv_c_and_k_pe_cache);
@@ -259,6 +265,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             page_size,
             bucket_id,
             &out,
+            &lse,
             &q_nope,
             &q_pe,
             &kv_c_and_k_pe_cache,

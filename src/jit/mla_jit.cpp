@@ -30,7 +30,7 @@ bool check_config(const char* op_label, std::string* err) {
 }
 
 using DecodeFn =
-    void (*)(void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
+    void (*)(void*, void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
 uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
@@ -68,6 +68,7 @@ bool mla_decode_launch(
     bool is_fp16,
     int page_size,
     void* out,
+    void* lse,
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -80,7 +81,7 @@ bool mla_decode_launch(
     std::string* err) {
   DecodeFn fn = resolve_decode(is_fp16, page_size, arch, err);
   if (!fn) return false;
-  fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+  fn(out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   return true;
 }
 
@@ -92,6 +93,7 @@ namespace {
 
 using PrefillFn = void (*)(
     int,
+    void*,
     void*,
     const void*,
     const void*,
@@ -135,6 +137,7 @@ bool mla_prefill_launch(
     int page_size,
     int bucket,
     void* out,
+    void* lse,
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -152,6 +155,7 @@ bool mla_prefill_launch(
   if (!fn) return false;
   fn(bucket,
      out,
+     lse,
      q_nope,
      q_pe,
      kv_c_and_k_pe_cache,
