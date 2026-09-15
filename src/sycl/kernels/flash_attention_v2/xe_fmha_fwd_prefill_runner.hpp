@@ -47,9 +47,17 @@
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
 
 using namespace cute;
 namespace prefill {
+inline constexpr int kRelBiasQTile = flash_attention_v2::relative_attention::kQTile;
+inline constexpr int kRelBiasKTile = flash_attention_v2::relative_attention::kKTile;
+
+inline constexpr int rel_bias_padded_cols(int rel_extent) {
+  return flash_attention_v2::relative_attention::padded_cols(rel_extent);
+}
+
 struct Arguments {
   // The QKV matrices.
   void* __restrict__ q_ptr;
@@ -75,6 +83,13 @@ struct Arguments {
   // The O matrix (output).
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
+
+  // Sheared relative logits in bf16: [total_q, h, rel_bias_padded_cols(extent)].
+  // This is device-produced and consumed directly without host-side staging.
+  void* __restrict__ rel_bias_ptr = nullptr;
+  int64_t rel_bias_token_stride = 0;
+  int64_t rel_bias_head_stride = 0;
+  int rel_bias_extent = 0;
 
   // The stride between rows of O.
   int64_t o_batch_stride;
@@ -273,22 +288,62 @@ struct PrefillRunner {
       shape = problem_shape_in;
     }
 
-    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
-        problem_size;
-    // NHD format
-    stride_Q = cutlass::make_stride(
-        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
-    stride_K = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
-    stride_V = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
-    stride_K_cache = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
-    stride_V_cache = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
-    stride_O = cutlass::make_stride(
-        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
-
+    auto
+        [batch,
+         num_heads_q,
+         num_heads_kv,
+         seq_len_qo,
+         seq_len_kv,
+         seq_len_kv_cache,
+         head_size_qk,
+         head_size_vo,
+         q_row_stride,
+         k_row_stride,
+         v_row_stride,
+         q_head_stride,
+         k_head_stride,
+         v_head_stride,
+         o_row_stride,
+         o_head_stride] =
+            cute::tuple_cat(
+                problem_size,
+                cute::make_tuple(
+                    params.q_row_stride,
+                    params.k_row_stride,
+                    params.v_row_stride,
+                    params.q_head_stride,
+                    params.k_head_stride,
+                    params.v_head_stride,
+                    params.o_row_stride,
+                    params.o_head_stride));
+    // Row/head strides come straight from the caller's tensors instead of
+    // being derived from head_size * num_heads, so q/k/v may be
+    // non-contiguous views (e.g. sliced out of a fused qkv projection)
+    // without an extra `.contiguous()` copy; only the last (head_size) dim
+    // must be contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
+    // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
+    // int64_t, so narrow explicitly before handing them to make_stride.
+    constexpr int64_t kIntMax = 2147483647LL;
+    TORCH_CHECK(
+        q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
+            k_head_stride <= kIntMax && v_head_stride <= kIntMax && o_row_stride <= kIntMax && o_head_stride <= kIntMax,
+        "Q/K/V/O stride exceeds int32 max (",
+        kIntMax,
+        ")");
+    int const q_row_stride_i = static_cast<int>(q_row_stride);
+    int const k_row_stride_i = static_cast<int>(k_row_stride);
+    int const v_row_stride_i = static_cast<int>(v_row_stride);
+    int const q_head_stride_i = static_cast<int>(q_head_stride);
+    int const k_head_stride_i = static_cast<int>(k_head_stride);
+    int const v_head_stride_i = static_cast<int>(v_head_stride);
+    int const o_row_stride_i = static_cast<int>(o_row_stride);
+    int const o_head_stride_i = static_cast<int>(o_head_stride);
+    stride_Q = cutlass::make_stride(q_row_stride_i, Int<1>{}, q_head_stride_i, q_row_stride_i * seq_len_qo);
+    stride_K = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv);
+    stride_V = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(o_row_stride_i, Int<1>{}, o_head_stride_i, o_row_stride_i * seq_len_qo);
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
@@ -403,6 +458,10 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            static_cast<const ElementQ*>(params.rel_bias_ptr),
+            params.rel_bias_token_stride,
+            params.rel_bias_head_stride,
+            params.rel_bias_extent,
         },
         {},
         hw_info};
@@ -569,7 +628,8 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
-    int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
+    bool HasRelBias = false,
+    int PipelineStages = 2,  // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,
@@ -648,7 +708,9 @@ struct FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        false,  // PackGQA is decode-only; relative attention always uses prefill.
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

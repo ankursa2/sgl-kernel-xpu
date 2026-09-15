@@ -402,7 +402,14 @@ class XeFMHAFwdKernel {
         const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
         blk_k0 = lo_kv / tile_k;
         blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
-        if (blk_k0 >= blk_k1) continue;
+        if (blk_k0 >= blk_k1) {
+          if constexpr (LSE) {
+            blk_k0 = 0;
+            blk_k1 = 0;
+          } else {
+            continue;
+          }
+        }
       }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
@@ -444,21 +451,24 @@ class XeFMHAFwdKernel {
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
-      // NHD layout for GQA
+      // Under standard NHD layout for GQA, non-contiguous stride layouts are currently disabled for PackedGQA_ = 1.
+      // When PackedGQA is enabled, the head dimension packs multiple query heads sharing the same KV group,
+      // causing standard stride calculations to mismatch the underlying memory layout.
+      // Supporting strided layouts for PackedGQA would require introducing a dedicated `head_stride`.
       auto layout_q = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
         }
         return make_layout(shape_Q, p.dQ);
       }();
       auto layout_k = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_K, VarLenKLayoutStep_{});
         }
         return make_layout(shape_K, p.dK);
       }();
       auto layout_v = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_V, VarLenVLayoutStep_{});
         }
         return make_layout(shape_V, p.dV);
@@ -466,7 +476,7 @@ class XeFMHAFwdKernel {
 
       // NHD layout for GQA
       auto layout_o = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_O, VarLenOLayoutStep_{});
         }
         return make_layout(shape_O, p.dO);
@@ -485,6 +495,12 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
+      int q_token_offset = 0;
+      if constexpr (is_var_len) {
+        q_token_offset = s.seq_len_qo.cumulative_length[idx_b];
+      } else {
+        q_token_offset = idx_b * int(s.seq_len_qo);
+      }
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       int score_region_cols = 0;
@@ -539,6 +555,9 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
@@ -565,6 +584,9 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
@@ -1012,6 +1034,9 @@ class XeFMHAFwdDynamicSplitKernel {
             0,
             0,
             0,
+            0,
+            0,
+            0,
             0);
 
         // partition id of start batch head id in current wg
@@ -1456,6 +1481,11 @@ class XeFMHAFwdSplitKVKernel {
         scale_v = *p.scale_v_ptr;
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      int bias_row_base = 0;
+      if constexpr (CollectiveMainloop::HasRelBias) {
+        int const q_token = is_var_len ? s.seq_len_qo.cumulative_length[idx_b] : idx_b * seq_len_qo;
+        bias_row_base = q_token * s.num_heads_q + head_q_start;
+      }
 
       mainloop(
           Q(_, _, head, l_coord),
@@ -1473,7 +1503,8 @@ class XeFMHAFwdSplitKVKernel {
           seq_len,
           full_tile_offset,
           discard_seq_coord,
-          scale_k);
+          scale_k,
+          bias_row_base);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

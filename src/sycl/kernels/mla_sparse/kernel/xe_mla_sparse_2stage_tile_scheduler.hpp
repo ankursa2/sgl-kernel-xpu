@@ -15,18 +15,20 @@
       - XeMlaSparseGather2StageTileScheduler<B_TOPK> (Stage 1, gather). Grid is
         (b * s_q, ceil_div(gathered_topk, B_TOPK), 1): BlockIdxX enumerates the
         (batch, seq) pairs row-major and BlockIdxY the topk-block, decoded into a
-        (batch_idx, seq_idx, topk_block_idx) coordinate. Unlike the Stage-2 scheduler
-        it also owns get_grid_shape, since the gather kernel's grid is derivable from
-        its params alone. Its Params slice is the *base* Gather2StageParams, so the
-        one scheduler serves both the decode and prefill param children.
+        (batch_idx, seq_idx, topk_block_idx) coordinate. (Swapping those two axes was
+        measured and did not pay -- see the note on get_grid_shape.) Unlike the
+        Stage-2 scheduler it also owns get_grid_shape, since the gather kernel's grid
+        is derivable from its params alone. Its Params slice is the *base*
+        Gather2StageParams, so the one scheduler serves both the decode and prefill
+        param children.
 
-      - XeMlaSparse2StageIndividualTileScheduler<B_H> (Stage 2, dense flash).
-        Grid is (ceil_div(h_q, B_H) * s_q * b, V_SPLIT, 1) (see
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy): BlockIdxX enumerates the
-        (batch, seq, head-block) tuples row-major and BlockIdxY the V-split, decoded
-        into a (batch_idx, seq_idx, head_bid, v_split_idx) coordinate — the exact
-        index math the Stage-2 kernel carried before it was decomposed into
-        collectives + scheduler, factored out here.
+      - XeMlaSparse2StageIndividualTileScheduler<B_H, V_SPLIT> (Stage 2, dense flash).
+        Grid is (ceil_div(h_q, B_H) * s_q * b * V_SPLIT, 1, num_kv_splits): BlockIdxX
+        enumerates the (batch, seq, head-block, v-split) tuples with the V-split
+        FASTEST-varying, decoded into a (batch_idx, seq_idx, head_bid, v_split_idx)
+        coordinate — the same index math the Stage-2 kernel carried before it was
+        decomposed into collectives + scheduler, factored out here, with V_SPLIT folded
+        into x instead of occupying grid.y (see the L2-locality note on the decode below).
 
     Neither name carries "Decode": both stages' schedulers, like the Stage-2 kernel and
     its collectives, are shared verbatim by the decode and prefill paths.
@@ -111,10 +113,12 @@ struct Sparse2StageWorkTile {
   int kv_split_idx;
 };
 
-template <int B_H_>
+template <int B_H_, int V_SPLIT_>
 class XeMlaSparse2StageIndividualTileScheduler {
  public:
   static constexpr int B_H = B_H_;
+  static constexpr int V_SPLIT = V_SPLIT_;
+  static_assert(V_SPLIT >= 1, "V_SPLIT must be >= 1");
 
   // The scheduler's own param slice: the two dims needed to enumerate head-blocks
   // per query tile. Built by the host adapter as the composite's `scheduler` member
@@ -125,12 +129,13 @@ class XeMlaSparse2StageIndividualTileScheduler {
   XeMlaSparse2StageIndividualTileScheduler(Params const& params) : valid_(true) {
     const int num_head_blocks = ceil_div(params.h_q, B_H);
     const int wg_id = int(BlockIdxX());
-    const int q_tile_idx = wg_id / num_head_blocks;
+    const int tile_idx = wg_id / V_SPLIT;
+    const int q_tile_idx = tile_idx / num_head_blocks;
 
     tile_.batch_idx = q_tile_idx / params.s_q;
     tile_.seq_idx = q_tile_idx - tile_.batch_idx * params.s_q;
-    tile_.head_bid = wg_id % num_head_blocks;
-    tile_.v_split_idx = int(BlockIdxY());
+    tile_.head_bid = tile_idx % num_head_blocks;
+    tile_.v_split_idx = wg_id % V_SPLIT;
     tile_.kv_split_idx = int(BlockIdxZ());
   }
 
@@ -152,6 +157,65 @@ class XeMlaSparse2StageIndividualTileScheduler {
 
  private:
   Sparse2StageWorkTile tile_;
+  bool valid_;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Stage 2 (split-K reduction).
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// A decoded reduction work-tile coordinate: one output row.
+struct Sparse2StageReduceWorkTile {
+  int batch_idx;
+  int seq_idx;
+  int head_idx;
+};
+
+// Reduction scheduler: one work-group per (batch, seq, head) output row. Enumerated over a
+// natural 3D grid with head on grid.x (fastest-varying) so neighbouring work-groups walk
+// contiguous o_accum / out rows -- both are [..., h_q, D_V] with the head stride == D_V, so
+// adjacent heads are adjacent rows. This is the paged reduction's scheme
+// (XeMlaReduceSplitKScheduler, mla/kernel/mla_tile_scheduler.hpp): because the grid is the
+// coordinate, get_block_coord reads it straight off BlockIdx with no divmod, and the kernel
+// body never touches BlockIdx -- matching the gather + dense Stage-2 schedulers above. Like
+// them it is a stateless single-tile decoder.
+class XeMlaSparse2StageReduceTileScheduler {
+ public:
+  // Reads only the three dims that size the grid. The reduction's Params is the whole dense
+  // SparseAttn2StageParams, so it forwards params.kernel.shape here.
+  using Params = SparseDecode2StageProblemShape;
+
+  // head -> grid.x (fastest), seq -> grid.y, batch -> grid.z. The reduction's can_implement
+  // guarantees all three are >= 1 before launch.
+  static dim3 get_grid_shape(Params const& shape) {
+    return dim3(shape.h_q, shape.s_q, shape.b);
+  }
+
+  CUTLASS_DEVICE
+  XeMlaSparse2StageReduceTileScheduler(Params const& /* shape */) : valid_(true) {
+    tile_.head_idx = int(BlockIdxX());
+    tile_.seq_idx = int(BlockIdxY());
+    tile_.batch_idx = int(BlockIdxZ());
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() const {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  Sparse2StageReduceWorkTile get_block_coord() const {
+    return tile_;
+  }
+
+  CUTLASS_DEVICE
+  XeMlaSparse2StageReduceTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+
+ private:
+  Sparse2StageReduceWorkTile tile_;
   bool valid_;
 };
 

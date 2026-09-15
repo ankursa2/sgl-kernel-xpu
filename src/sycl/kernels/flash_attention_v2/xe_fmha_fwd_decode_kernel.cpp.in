@@ -53,34 +53,81 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
       @PAGE_SIZE@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
 
-  // softmax_lse output is only threaded as a template constexpr for the base
-  // (non-local / non-sink) configuration, matching the paged cascade-attention
-  // decode use case. All other mask combinations keep the always-off LSE path
-  // (LSE is not written).
+  // softmax_lse output is threaded as a template constexpr, so every mask
+  // combination that can emit it needs its own kernel instantiation. Decode is
+  // always non-causal (a single query token cannot be masked by a causal rule),
+  // so only the local axis fans out here; the sink path keeps the always-off LSE
+  // instantiations only (sink + LSE is not compiled).
   if (params.return_softmax_lse) {
-    TORCH_CHECK(
-        !params.is_local && !params.use_sink,
-        "return_softmax_lse is only supported without local/sink masking");
-    using Element = @ELEM_TYPE@;
-    DecodeConfig<
-        false,
-        false,
-        false,
-        /*LSE=*/true,
-        TileShapeQK,
-        TileShapePV,
-        TileShapeOutput,
-        SubgroupLayoutQK,
-        void,
-        1,
-        false,
-        Element,
-        Element,
-        Element,
-        Element,
-        /*PackGQAEnabled=*/false>::run_paged(params);
+    TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      using Element = @ELEM_TYPE@;
+      DecodeConfig<
+          false,
+          LocalMask,
+          false,
+          /*LSE=*/true,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          1,
+          false,
+          Element,
+          Element,
+          Element,
+          Element,
+          /*PackGQAEnabled=*/false>::run_paged(params);
+    });
     return;
   }
+
+#if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 512
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == @HEAD_DIM@, "relative attention requires head_dim_v == @HEAD_DIM@");
+    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(
+        params.rel_bias_head_stride ==
+            flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
+        "relative attention expects a decode-sheared bias with ",
+        flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
+        " columns");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      using Element = @ELEM_TYPE@;
+      DecodeConfig<
+          false,
+          LocalMask,
+          false,
+          /*LSE=*/false,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          1,
+          false,
+          Element,
+          Element,
+          Element,
+          Element,
+          /*PackGQAEnabled=*/false,
+          void,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<cute::_1, int, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          void,
+          void,
+          void,
+          void,
+          true>::run_paged(params);
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128 or 512");
+#endif
 
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {

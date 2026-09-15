@@ -46,6 +46,7 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
 using namespace cute;
 namespace decode {
 
@@ -225,6 +226,13 @@ struct Arguments {
   int window_size_left = -1;
   int window_size_right = -1;
 
+  // Sheared relative-attention bias. The decode producer uses a zero M-drift
+  // surface [total_q, h, rel_bias_head_stride], unlike prefill's Q-tile drift.
+  void* __restrict__ rel_bias_ptr = nullptr;
+  int64_t rel_bias_token_stride = 0;
+  int64_t rel_bias_head_stride = 0;
+  int rel_bias_extent = 0;
+
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
 
@@ -325,21 +333,62 @@ struct DecodeRunner {
       shape = problem_shape_in;
     }
 
-    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
-        problem_size;
-    // NHD format
-    stride_Q = cutlass::make_stride(
-        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
-    stride_K = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
-    stride_V = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
-    stride_K_cache = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
-    stride_V_cache = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
-    stride_O = cutlass::make_stride(
-        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
+    auto
+        [batch,
+         num_heads_q,
+         num_heads_kv,
+         seq_len_qo,
+         seq_len_kv,
+         seq_len_kv_cache,
+         head_size_qk,
+         head_size_vo,
+         q_row_stride,
+         k_row_stride,
+         v_row_stride,
+         q_head_stride,
+         k_head_stride,
+         v_head_stride,
+         o_row_stride,
+         o_head_stride] =
+            cute::tuple_cat(
+                problem_size,
+                cute::make_tuple(
+                    params.q_row_stride,
+                    params.k_row_stride,
+                    params.v_row_stride,
+                    params.q_head_stride,
+                    params.k_head_stride,
+                    params.v_head_stride,
+                    params.o_row_stride,
+                    params.o_head_stride));
+    // Row/head strides come straight from the caller's tensors so q/k/v may be
+    // non-contiguous views (e.g. sliced out of a fused qkv projection) without
+    // an extra `.contiguous()` copy; only the last (head_size) dim must be
+    // contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
+    // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
+    // int64_t, so narrow explicitly before handing them to make_stride.
+    constexpr int64_t kIntMax = 2147483647LL;
+    TORCH_CHECK(
+        q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
+            k_head_stride <= kIntMax && v_head_stride <= kIntMax && o_row_stride <= kIntMax && o_head_stride <= kIntMax,
+        "Q/K/V/O stride exceeds int32 max (",
+        kIntMax,
+        ")");
+    int const q_row_stride_i = static_cast<int>(q_row_stride);
+    int const k_row_stride_i = static_cast<int>(k_row_stride);
+    int const v_row_stride_i = static_cast<int>(v_row_stride);
+    int const q_head_stride_i = static_cast<int>(q_head_stride);
+    int const k_head_stride_i = static_cast<int>(k_head_stride);
+    int const v_head_stride_i = static_cast<int>(v_head_stride);
+    int const o_row_stride_i = static_cast<int>(o_row_stride);
+    int const o_head_stride_i = static_cast<int>(o_head_stride);
+
+    stride_Q = cutlass::make_stride(q_row_stride_i, Int<1>{}, q_head_stride_i, q_row_stride_i * seq_len_qo);
+    stride_K = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv);
+    stride_V = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(o_row_stride_i, Int<1>{}, o_head_stride_i, o_row_stride_i * seq_len_qo);
 
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
@@ -384,7 +433,11 @@ struct DecodeRunner {
          params.page_size,
          params.max_num_pages_per_seq,
          params.window_size_left,
-         params.window_size_right},
+         params.window_size_right,
+         static_cast<const ElementQ*>(params.rel_bias_ptr),
+         params.rel_bias_token_stride,
+         params.rel_bias_head_stride,
+         params.rel_bias_extent},
         {},
         hw_info};
 
@@ -558,7 +611,10 @@ struct SplitDecodeKernelRunner {
          params.max_num_pages_per_seq,
          params.total_k,
          params.window_size_left,
-         params.window_size_right},
+         params.window_size_right,
+         static_cast<const ElementQ*>(params.rel_bias_ptr),
+         params.rel_bias_head_stride,
+         params.rel_bias_extent},
         {},
         hw_info,
         params.num_kv_splits};
@@ -654,7 +710,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool HasRelBias = false>
 struct DecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
@@ -735,7 +792,8 @@ struct DecodeConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
         LocalMask,
-        PackGQA>;
+        PackGQA,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
@@ -804,7 +862,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool HasRelBias = false>
 struct SplitDecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation =
@@ -856,7 +915,8 @@ struct SplitDecodeConfig {
         GmemTiledCopyQ,
         GmemTiledCopyK,
         GmemTiledCopyV,
-        LocalMask>;
+        LocalMask,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

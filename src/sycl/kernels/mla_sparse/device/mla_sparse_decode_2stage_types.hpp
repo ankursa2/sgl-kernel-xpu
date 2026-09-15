@@ -171,7 +171,7 @@ struct MlaSparseDecode2StageXe {
       cutlass::flash_attention::collective::XeMlaSparse2StageMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::
       XeMlaSparse2StageEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS, IS_SPLIT_KV>;
-  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparse2StageIndividualTileScheduler<B_H_>;
+  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparse2StageIndividualTileScheduler<B_H_, V_SPLIT_>;
 
   using DenseKernel = cutlass::flash_attention::kernel::
       XeMlaSparse2StageDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
@@ -344,6 +344,9 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   // --- Epilogue slice: reduce / normalize / LSE / attn_sink (no max_logits for decode). ---
   auto& ep = params.epilogue;
   ep.h_q = h_q;
+  ep.b = b;
+  ep.s_q = s_q;
+  ep.num_kv_splits = num_kv_splits;
   ep.sm_scale_div_log2 = sm_scale_div_log2;
   ep.lse = reinterpret_cast<float*>(lse_out.data_ptr());
   ep.stride_lse_b = to_int_stride(lse_out.stride(0));
@@ -375,6 +378,8 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   g.extra_num_blocks = extra_num_blocks;
   g.extra_page_block_size = extra_page_block_size;
   g.extra_topk = extra_topk;
+  g.page_block_divmod = cutlass::FastDivmod(std::max(1, page_block_size));
+  g.extra_page_block_divmod = cutlass::FastDivmod(std::max(1, extra_page_block_size));
   g.kv = reinterpret_cast<uint8_t*>(k_cache.data_ptr());
   g.stride_kv_block = to_int_stride(k_cache.stride(0));
   g.extra_kv = has_extra ? reinterpret_cast<uint8_t*>(extra_k_cache.value().data_ptr()) : nullptr;
@@ -461,15 +466,7 @@ inline void runMlaSparse2StageImpl(
   // Use a loose cap so typical decode shapes stay a single launch and only
   // pathologically large batch*topk get split across launches.
   constexpr int64_t DECODE_GATHERED_K_MAX_BYTES = 512LL * 1024 * 1024;
-  // Per-batch workspace footprint comes from the runner (which sums its stages'
-  // get_workspace_size) rather than being recomputed here: the gathered-KV tile +
-  // valid mask are Stage 1's outputs, so their layout is the gather kernel's
-  // business. Probe with b == 1 and the real (s_q, gathered_topk) to get the
-  // per-batch bytes the cap above is divided by.
-  // Split-K factor for this call. Resolved from the FULL batch, before chunking: chunking
-  // only engages at batch sizes far beyond where the grid is starved, so the full-b answer
-  // is 1 exactly when chunking is in play. Resolving per chunk instead would be circular
-  // (the chunk size depends on the split-K scratch, which depends on the factor).
+
   const int num_kv_splits = kSplitK ? F::resolve_sparse_2stage_num_kv_splits(
                                           b,
                                           s_q,
@@ -485,8 +482,7 @@ inline void runMlaSparse2StageImpl(
   probe_args.gather.b = 1;
   probe_args.gather.s_q = s_q;
   probe_args.gather.gathered_topk = gathered_topk;
-  // Also probe the dense stage so the cap covers the split-K scratch (o_accum + stats),
-  // not just Stage 1's gathered-KV tile. Zero when split-K is off.
+
   probe_args.dense.kernel.shape.b = 1;
   probe_args.dense.kernel.shape.s_q = s_q;
   probe_args.dense.kernel.shape.h_q = h_q;
@@ -560,6 +556,7 @@ inline void runMlaSparse2StageImpl(
   for (int b0 = 0; b0 < b; b0 += chunk_b) {
     const int cb = std::min(chunk_b, b - b0);
     params.kernel.shape.b = cb;
+    params.epilogue.b = cb;  // keep the epilogue's lse / stat layout extent in step with the chunk
     gather_args.b = cb;
 
     void* q_ptr = batch_base(q, b0);
