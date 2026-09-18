@@ -56,6 +56,7 @@ namespace mla_prefill {
 #define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET) \
   void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(  \
       at::Tensor& out,                               \
+      at::Tensor& lse,                                \
       const at::Tensor& q_nope,                      \
       const at::Tensor& q_pe,                        \
       const at::Tensor& kv_c_and_k_pe_cache,         \

@@ -60,6 +60,7 @@ def flash_mla_decode(
     workspace: torch.Tensor,
     sm_scale: float,
     num_kv_splits: int = 1,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
@@ -118,8 +119,12 @@ def flash_mla_decode(
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
 
+    # lse is log base 2, one value per (batch, head)
+    lse = torch.empty((B_q, H), dtype=torch.float32, device=q_nope.device)
+
     torch.ops.sgl_kernel.flash_mla_decode.default(
         out,
+        lse,
         q_nope,
         q_pe,
         kv_c_and_k_pe_cache,
@@ -129,7 +134,10 @@ def flash_mla_decode(
         sm_scale,
         num_kv_splits,
     )
-    return out if device_type == "xpu" else out[:, :H].contiguous()
+    out = out if device_type == "xpu" else out[:, :H].contiguous()
+    if return_lse:
+        return out, lse
+    return out
 
 
 def flash_mla_get_workspace_size(
@@ -170,6 +178,7 @@ def flash_mla_prefill(
     sm_scale: float,
     causal: bool = True,
     num_kv_splits: int = -1,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """MLA prefill with varlen/ragged Q and causal masking.
 
@@ -228,8 +237,13 @@ def flash_mla_prefill(
     total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
     out = q_nope.new_empty((total_q_padded, H, D_latent))
 
+    # lse is log base 2, one value per (q row, head); same padding as out
+    # since the epilogue writes full Q_TILE_M rows per tile.
+    lse = torch.empty((total_q_padded, H), dtype=torch.float32, device=q_nope.device)
+
     torch.ops.sgl_kernel.flash_mla_prefill.default(
         out,
+        lse,
         q_nope.contiguous(),
         q_pe.contiguous(),
         kv_c_and_k_pe_cache,
@@ -242,6 +256,8 @@ def flash_mla_prefill(
         causal,
         num_kv_splits,
     )
+    if return_lse:
+        return out[:total_q], lse[:total_q]
     return out[:total_q]
 
 
