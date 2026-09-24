@@ -50,9 +50,10 @@ struct SplitKVWorkspaceLayout {
   size_t max_logits_offset;
   size_t total_bytes;
 
-  SplitKVWorkspaceLayout(int batch, int num_heads, int num_splits, int head_size_o, size_t elem_o_size) {
-    size_t o_accum_bytes = size_t(batch) * num_heads * num_splits * head_size_o * elem_o_size;
-    size_t lse_bytes = size_t(batch) * num_heads * num_splits * sizeof(float);
+  SplitKVWorkspaceLayout(
+      int batch, int num_heads, int num_splits, int head_size_o, size_t elem_o_size, int seq_len_q = 1) {
+    size_t o_accum_bytes = size_t(seq_len_q) * batch * num_heads * num_splits * head_size_o * elem_o_size;
+    size_t lse_bytes = size_t(seq_len_q) * batch * num_heads * num_splits * sizeof(float);
 
     size_t o_accum_aligned = (o_accum_bytes + 255) & ~size_t(255);
     size_t lse_aligned = (lse_bytes + 255) & ~size_t(255);
@@ -529,7 +530,7 @@ class XeMlaSplitKVKernel {
       assert(false && "non Split-K workspace size is calculated in different path");
     }
     auto const& s = args.kernel.shape;
-    SplitKVWorkspaceLayout ws(s.batch, s.num_heads_q, splits, s.head_size_o, sizeof(ElementO));
+    SplitKVWorkspaceLayout ws(s.batch, s.num_heads_q, splits, s.head_size_o, sizeof(ElementO), s.seq_len_qo);
     return ws.total_bytes;
   }
 
@@ -582,9 +583,9 @@ class XeMlaSplitKVKernel {
       // exp_sums=0 gates any garbage in O_accum for this split.
       // max_logits=lowest() ensures empty splits don't pollute global_max.
       if (start_blk >= total_blk) {
-        if (thr_id == 0) {
-          gExpSums(0, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
-          gMaxLogits(0, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
+        if (thr_id < s.seq_len_qo) {
+          gExpSums(thr_id, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
+          gMaxLogits(thr_id, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
         }
         continue;
       }
@@ -618,6 +619,13 @@ class XeMlaSplitKVKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
+      // Causal (s_q > 1): mask k_pos > causal_offset + q_pos. The Q tile holds all
+      // s_q rows, so the causal K bound equals total_blk and end_blk needs no clamp.
+      int causal_offset = 0;
+      if constexpr (CollectiveMainloop::CausalMask) {
+        causal_offset = seq_len_kv - s.seq_len_qo;
+      }
+
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q_nope(_, _, head_coord, batch_coord),
@@ -634,7 +642,8 @@ class XeMlaSplitKVKernel {
           total_blk,
           thr_id,
           seq_len_kv,
-          batch_coord);
+          batch_coord,
+          causal_offset);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -653,8 +662,8 @@ class XeMlaSplitKVKernel {
           tA_sum,
           blk_qv,
           thr_id,
-          gExpSums(0, idx_kv_split, head_coord, batch_coord),
-          gMaxLogits(0, idx_kv_split, head_coord, batch_coord),
+          gExpSums(_, idx_kv_split, head_coord, batch_coord),
+          gMaxLogits(_, idx_kv_split, head_coord, batch_coord),
           num_kv_splits);
     }
   }

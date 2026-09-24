@@ -100,7 +100,7 @@ struct FMlAProblemShape {
 };
 
 //----------------- define MLA Xe configuration --------------------//
-template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename SplitKVOption = EnabledSplitKV<false>>
+template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename SplitKVOption = EnabledSplitKV<false>, int QTileM = 1>
 struct MlaXe {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -108,13 +108,17 @@ struct MlaXe {
   static constexpr int PAGE_SIZE = PageSizeOpt::value;
   using KvTileSizeType = cute::Int<PAGE_SIZE>;
 
-  static constexpr int NumSubgroupsN = PAGE_SIZE / 16;
+  static constexpr int Q_TILE_M = QTileM;
+  static constexpr int NumSubgroupsM = (Q_TILE_M == 1) ? 1 : Q_TILE_M / 2;  // 2 q rows per SG
+  static constexpr int NumSubgroupsN =
+      (Q_TILE_M == 1) ? PAGE_SIZE / 16 : std::max(1, std::min(PAGE_SIZE / 16, 8 / NumSubgroupsM));
 
-  using TileShapeQK = Shape<_1, KvTileSizeType, _64>;
-  using TileShapePV = Shape<_1, _64, KvTileSizeType>;
-  using TileShapeOutput = Shape<_1, _512>;
+  using QTileSizeType = cute::Int<Q_TILE_M>;
+  using TileShapeQK = Shape<QTileSizeType, KvTileSizeType, _64>;
+  using TileShapePV = Shape<QTileSizeType, _64, KvTileSizeType>;
+  using TileShapeOutput = Shape<QTileSizeType, _512>;
 
-  using SubgroupLayoutQK = Layout<Shape<_1, cute::Int<NumSubgroupsN>, _1>>;
+  using SubgroupLayoutQK = Layout<Shape<cute::Int<NumSubgroupsM>, cute::Int<NumSubgroupsN>, _1>>;
   using SubgroupLayoutPV = decltype(cutlass::flash_attention::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
 
   using ElementType = typename ToCutlassElementType<T>::type;
@@ -165,7 +169,7 @@ struct MlaXe {
   using MainloopDispatchPolicy = cutlass::flash_attention::XeDefault<PipelineStages>;
   using CollectiveMainloop = cutlass::flash_attention::collective::XeMlaMainloop<
       MainloopDispatchPolicy,
-      false,  // CausalMask: decode attends to all past KV, no masking needed
+      (Q_TILE_M > 1),  // CausalMask: s_q > 1 query tokens mask future KV among themselves
       TiledMMAQK,
       TiledMMAPV,
       VTiles,
@@ -216,10 +220,12 @@ inline typename T::Fmla::Arguments args_from_options(
   // q_pe:   (bs, num_heads, q_pe_dim)   where q_pe_dim = 64 (d_rope)
   // kv_cache: (num_blocks, block_size, head_dim) where head_dim = 576 (d_latent + d_rope)
   // out:    (bs, num_heads, v_head_dim)
+  const bool is_4d = q_nope.dim() == 4;
   int batch = q_nope.size(0);
-  int num_heads = q_nope.size(1);
-  int v_head_dim = q_nope.size(2);
-  int q_pe_dim = q_pe.size(2);
+  int seq_len_q = is_4d ? q_nope.size(1) : 1;
+  int num_heads = q_nope.size(-2);
+  int v_head_dim = q_nope.size(-1);
+  int q_pe_dim = q_pe.size(-1);
   int head_dim = kv_c_and_k_pe_cache.size(2);
   int page_size = kv_c_and_k_pe_cache.size(1);
   int page_count_per_seq = page_table.size(1);
@@ -230,7 +236,7 @@ inline typename T::Fmla::Arguments args_from_options(
   problem_shape.batch = batch;
   problem_shape.num_heads_q = num_heads;
   problem_shape.num_heads_kv = 1;
-  problem_shape.seq_len_qo = 1;
+  problem_shape.seq_len_qo = seq_len_q;
   problem_shape.seq_len_kv = max_seq_len;
   problem_shape.head_size_q_nope = v_head_dim;
   problem_shape.head_size_q_pe = q_pe_dim;
@@ -251,15 +257,15 @@ inline typename T::Fmla::Arguments args_from_options(
   using ElementLSE = typename T::ElementLSE;
 
   StrideQ stride_Q_nope = cute::make_stride(
-      static_cast<int>(batch * num_heads * v_head_dim),
+      static_cast<int>(is_4d ? q_nope.stride(1) : batch * num_heads * v_head_dim),
       cute::_1{},
-      static_cast<int>(q_nope.stride(1)),
+      static_cast<int>(q_nope.stride(-2)),
       static_cast<int>(q_nope.stride(0)));
 
   StrideQ stride_Q_pe = cute::make_stride(
-      static_cast<int>(batch * num_heads * q_pe_dim),
+      static_cast<int>(is_4d ? q_pe.stride(1) : batch * num_heads * q_pe_dim),
       cute::_1{},
-      static_cast<int>(q_pe.stride(1)),
+      static_cast<int>(q_pe.stride(-2)),
       static_cast<int>(q_pe.stride(0)));
 
   StrideK stride_K = cute::make_stride(
@@ -275,14 +281,14 @@ inline typename T::Fmla::Arguments args_from_options(
       static_cast<int>(1));
 
   StrideO stride_O = cute::make_stride(
-      static_cast<int>(batch * num_heads * v_head_dim),
+      static_cast<int>(is_4d ? out.stride(1) : batch * num_heads * v_head_dim),
       cute::_1{},
-      static_cast<int>(out.stride(1)),
+      static_cast<int>(out.stride(-2)),
       static_cast<int>(out.stride(0)));
 
-  // lse: (batch, num_heads) -> kernel layout (seq_len_qo == 1, num_heads, batch)
+  // lse: (batch, num_heads) or (batch, s_q, num_heads) -> kernel layout (seq_len_qo, num_heads, batch)
   StrideLSE stride_LSE = cute::make_stride(
-      static_cast<int>(batch * num_heads), cute::_1{}, static_cast<int>(lse.has_value() ? lse->stride(0) : 0));
+      static_cast<int>(lse.has_value() && is_4d ? lse->stride(1) : batch * num_heads), cute::_1{}, static_cast<int>(lse.has_value() ? lse->stride(0) : 0));
 
   typename T::Fmla::KernelArguments kernel_args{};
   kernel_args.shape = problem_shape;
@@ -306,7 +312,7 @@ inline typename T::Fmla::Arguments args_from_options(
   if constexpr (T::is_split_kv) {
     using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
     SplitKVWorkspaceLayout ws(
-        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO));
+        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO), seq_len_q);
 
     auto* ws_ptr = static_cast<char*>(workspace.data_ptr());
     auto* o_accum_ptr = reinterpret_cast<ElementO*>(ws_ptr + ws.o_accum_offset);
@@ -341,7 +347,7 @@ inline typename T::Fmla::Arguments args_from_options(
   return arguments;
 }
 
-template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
+template <typename Element, typename PageSizeOpt, typename SplitKVOpt, int QTileM>
 inline void runMlaImpl(
     at::Tensor& out,
     std::optional<at::Tensor> const& lse,
@@ -353,7 +359,7 @@ inline void runMlaImpl(
     at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
+  using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt, QTileM>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
@@ -377,12 +383,15 @@ inline void runMla(
     int64_t num_kv_splits) {
   TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be resolved before calling runMla, got ", num_kv_splits);
 
+  const bool is_4d = q_nope.dim() == 4;
+  int seq_len_q = is_4d ? q_nope.size(1) : 1;
+
   if (num_kv_splits > 1) {
     using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
     int batch = q_nope.size(0);
-    int num_heads = q_nope.size(1);
-    int head_size_o = q_nope.size(2);
-    SplitKVWorkspaceLayout ws(batch, num_heads, num_kv_splits, head_size_o, sizeof(Element));
+    int num_heads = q_nope.size(-2);
+    int head_size_o = q_nope.size(-1);
+    SplitKVWorkspaceLayout ws(batch, num_heads, num_kv_splits, head_size_o, sizeof(Element), seq_len_q);
     TORCH_CHECK(
         static_cast<size_t>(workspace.numel()) >= ws.total_bytes,
         "MLA workspace too small: need ",
@@ -395,11 +404,34 @@ inline void runMla(
         "matching (batch, num_heads, max_seq_len, page_size) parameters.");
   }
 
-  if (num_kv_splits == 1) {
-    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
-  } else {
-    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+  auto run = [&](auto q_tile) {
+    constexpr int QT = decltype(q_tile)::value;
+    if (num_kv_splits == 1) {
+      runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>, QT>(
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+    } else {
+      runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>, QT>(
+          out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+    }
+  };
+
+  switch (seq_len_q) {
+    case 1:
+      run(cute::Int<1>{});
+      break;
+    case 2:
+      run(cute::Int<2>{});
+      break;
+    case 4:
+      run(cute::Int<4>{});
+      break;
+    case 8:
+      run(cute::Int<8>{});
+      break;
+    case 16:
+      run(cute::Int<16>{});
+      break;
+    default:
+      TORCH_CHECK(false, "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}, got ", seq_len_q);
   }
 }

@@ -199,7 +199,10 @@ class MLA {
   // Prefill: 256 GRF — required to fit Q_TILE_M up to 256 without spill.
   // Decode: 128 GRF — Q_TILE_M=1 fits comfortably; halving GRF doubles
   //                   threads/EU and helps hide HBM latency.
-  static constexpr int kGrfSize = Kernel::CollectiveMainloop::IsPrefill ? 256 : 128;
+  //         256 GRF — Q_TILE_M>1 (s_q > 1): each SG holds 2 rows of the
+  //                   512-wide O accumulator, which spills at 128 GRF.
+  static constexpr int kGrfSize =
+      (Kernel::CollectiveMainloop::IsPrefill || int(Kernel::CollectiveMainloop::QK_BLK_M) > 1) ? 256 : 128;
 
   static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     if constexpr (!Kernel::is_split_kv) {
